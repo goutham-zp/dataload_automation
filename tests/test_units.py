@@ -1,10 +1,14 @@
 """Tests that need no database. The plan tests only read server_content; they run nothing in it."""
+import contextlib
+import io
+import os
 import tempfile
 import unittest
 from pathlib import Path
 
 from dataload import counts, plan
 from dataload.conf import OraConf
+from dataload.redact import redact
 from dataload.config import Config
 from dataload.runner import Engine, Flags, first_error, human, last_output_line, parse_chunk_output, parse_test_count
 
@@ -141,6 +145,62 @@ class Counting(unittest.TestCase):
 
     def test_sizes_read_well(self):
         self.assertEqual([counts.human_bytes(n) for n in (None, 512, 1536, 5 * 1024 ** 3)], ["", "512 B", "1.5 KB", "5.0 GB"])
+
+
+class Redaction(unittest.TestCase):
+    def test_values_are_hidden_and_the_error_is_kept(self):
+        cases = {
+            "FATAL: ERROR:  Account Number: 412718071   | Substring: 4127 | Error Message : function public.digest(bytea, unknown) does not exist":
+                "FATAL: ERROR:  Account Number: ***   | Substring: *** | Error Message : function public.digest(bytea, unknown) does not exist",
+            'ERROR:  duplicate key value violates unique constraint "x_pkey" DETAIL:  Key (id, email)=(42, a.b@example.com) already exists.':
+                'ERROR:  duplicate key value violates unique constraint "x_pkey" DETAIL:  Key (id, email)=(***) already exists.',
+            'ERROR: null value in column "name" violates not-null constraint DETAIL:  Failing row contains (17, null, Jane Doe, 1 Main St).':
+                'ERROR: null value in column "name" violates not-null constraint DETAIL:  Failing row contains (***).',
+            'ERROR:  invalid input syntax for type integer: "12a-secret" CONTEXT:  COPY r_company, line 88, column tax_id: "12a-secret"':
+                'ERROR:  invalid input syntax for type integer: "***" CONTEXT:  COPY r_company, line 88, column tax_id: "***"',
+            "contact jane.doe@example.com about it": "contact *** about it",
+        }
+        for text, expected in cases.items():
+            self.assertEqual(redact(text), expected)
+
+    def test_codes_counts_and_names_are_left_alone(self):
+        for text in ("FATAL: ORA-03114: not connected to ORACLE",
+                     "FATAL: 12545 ... ORA-12545: Connect failed"[13:],
+                     "row count mismatch: oracle=436889 postgres=0",
+                     'relation "fts.a_eft_processed_p20260101" does not exist',
+                     "PL/pgSQL function mask_account_number(text) line 18 at RAISE",
+                     "ora2pg exit code 2", ""):
+            self.assertEqual(redact(text), text)
+        self.assertIsNone(redact(None))
+
+
+class FriendlyStartErrors(unittest.TestCase):
+    def run_cli(self, *argv):
+        from dataload.cli import main
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = main(list(argv))
+        return code, out.getvalue()
+
+    def test_missing_settings_file_is_explained(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            code, out = self.run_cli("--config", f"{tmp}/dataload.toml", "plan")
+        self.assertEqual(code, 2)
+        self.assertIn("Settings file not found", out)
+        self.assertIn("Run this from the folder that holds dataload.toml", out)
+
+    def test_deleted_current_folder_is_explained(self):
+        before = os.getcwd()
+        gone = tempfile.mkdtemp()
+        os.chdir(gone)
+        os.rmdir(gone)
+        try:
+            code, out = self.run_cli("plan")
+        finally:
+            os.chdir(before)
+        self.assertEqual(code, 2)
+        self.assertIn("no longer exists", out)
+        self.assertNotIn("Traceback", out)
 
 
 class Progress(unittest.TestCase):

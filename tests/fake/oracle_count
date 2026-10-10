@@ -13,6 +13,9 @@ from pathlib import Path
 source = json.loads(Path(os.environ["FAKE_ORA_SOURCE"]).read_text() or "{}")
 for line in sys.stdin:
     ident, _, query = line.rstrip("\n").partition("\t")
+    if "v$session" in query:      # no statement is running for this account
+        print(f"{ident}\t0")
+        continue
     if "FROM dual" in query:
         print(f"{ident}\t1")
         continue

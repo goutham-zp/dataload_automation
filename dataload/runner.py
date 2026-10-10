@@ -4,6 +4,7 @@ import re
 import shutil
 import signal
 import subprocess
+import tempfile
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -14,6 +15,7 @@ from datetime import datetime
 from . import counts, plan, report
 from .conf import OraConf
 from .notify import Notifier
+from .redact import redact
 
 ERROR_RE = re.compile(
     r"FATAL|ERROR|ORA-\d{5}|Aborting export|an error occurs during data export|install_driver\(\w+\) failed"
@@ -39,6 +41,7 @@ class Flags:
     skip_validate: bool = False
     force_recreate: bool = False
     allow_remaining_fks: bool = False
+    skipped: set = field(default_factory=set)         # phase names, for messages: drop, recreate, load, validate
 
 
 def lines_of(text):
@@ -107,10 +110,11 @@ class Engine:
         self.transient_re = re.compile("|".join(cfg.transient))
         self.stopping = False
         self.children = set()
-        self.children_lock = threading.Lock()
+        self.children_lock = threading.RLock()   # re-entrant: the signal handler may interrupt a holder
         self.pg_env = {}
         self.target = ""
         self.source = ""
+        self.stopped_pids = []
         cfg.logs.mkdir(parents=True, exist_ok=True)
         cfg.work.mkdir(parents=True, exist_ok=True)
         cfg.report = cfg.report or cfg.root / "report.html"
@@ -133,13 +137,72 @@ class Engine:
         def handler(signum, _frame):
             self.stopping = True
             with self.children_lock:
-                for child in list(self.children):
-                    try:
-                        os.killpg(child.pid, signal.SIGTERM)
-                    except ProcessLookupError:
-                        pass
+                roots = [child.pid for child in self.children]
+            self.stopped_pids = self.kill_tree(roots)
         signal.signal(signal.SIGTERM, handler)
         signal.signal(signal.SIGINT, handler)
+
+    @staticmethod
+    def kill_tree(roots, sig=signal.SIGTERM):
+        """Signals the given processes and everything they started. GNU parallel gives every job its own
+        process group, so the group of the script is not enough, or ora2pg would keep copying."""
+        parents = {}
+        try:
+            listing = subprocess.run(["ps", "-eo", "pid=,ppid="], capture_output=True, text=True).stdout
+            for line in listing.splitlines():
+                pid, ppid = line.split()
+                parents.setdefault(int(ppid), []).append(int(pid))
+        except (OSError, ValueError):
+            pass
+        victims, queue = [], list(roots)
+        while queue:
+            pid = queue.pop()
+            victims.append(pid)
+            queue.extend(parents.get(pid, []))
+        for pid in victims:
+            try:
+                os.kill(pid, sig)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return victims
+
+    @staticmethod
+    def finish_off(pids, grace=10):
+        """An ora2pg reader in the middle of a fetch does not act on a polite stop. Whatever is still
+        alive after the grace period is killed outright, so nothing keeps copying in the background."""
+        deadline = time.time() + grace
+        alive = list(pids)
+        while alive and time.time() < deadline:
+            time.sleep(0.5)
+            still = []
+            for pid in alive:
+                try:
+                    os.kill(pid, 0)
+                    still.append(pid)
+                except (ProcessLookupError, PermissionError):
+                    pass
+            alive = still
+        for pid in alive:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return alive
+
+    def lost_connection(self, conf):
+        """True when neither database is doing anything for this load: no Oracle session of this account
+        has answered a call in the last two minutes and PostgreSQL has no session at work. False when
+        either is busy or cannot be asked."""
+        # A table with LOB columns is fetched one row per call, so its session shows INACTIVE between
+        # calls while it is hard at work; the time since its last call is what tells it from a dead one.
+        values, errors = self.oracle_values(conf, {"busy": (
+            "SELECT COUNT(*) FROM v$session WHERE username = USER AND (status = 'ACTIVE' OR last_call_et < 120) "
+            "AND sid <> SYS_CONTEXT('USERENV', 'SID')")})
+        if errors or values.get("busy", 1) > 0:
+            return False
+        rc, out, _ = self.psql("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() "
+                               "AND pid <> pg_backend_pid() AND state <> 'idle'")
+        return rc == 0 and out.strip() == "0"
 
     def _spawn(self, argv, **kwargs):
         child = subprocess.Popen(argv, start_new_session=True, **kwargs)
@@ -151,13 +214,19 @@ class Engine:
         with self.children_lock:
             self.children.discard(child)
 
-    def exec_logged(self, argv, cwd, log_path, env=None, label=None, progress=None):
+    def exec_logged(self, argv, cwd, log_path, env=None, label=None, progress=None, conf=None, activity=None):
         """Runs argv with its output in log_path. With a label, a "still running" line is logged
         every heartbeat, carrying progress() or else the newest line of the output."""
-        started = beat = time.time()
+        started = beat = checked = time.time()
+        stall = self.cfg.stall_minutes * 60 if conf else 0
+        killed_at, stalled_pids, stop_seen = None, [], None
+        # A private temp directory: ora2pg takes any tmp_ora2pg* file in its temp directory as an error,
+        # so a file left by a killed ora2pg must never be visible to the next one.
+        (self.cfg.work / "tmp").mkdir(parents=True, exist_ok=True)
+        private_tmp = tempfile.mkdtemp(prefix="t", dir=self.cfg.work / "tmp")
         with open(log_path, "ab") as out:
             child = self._spawn(argv, cwd=cwd, stdout=out, stderr=subprocess.STDOUT,
-                                env={**os.environ, **(env or {})})
+                                env={**os.environ, "TMPDIR": private_tmp, **(env or {})})
             try:
                 while True:
                     try:
@@ -165,6 +234,31 @@ class Engine:
                         break
                     except subprocess.TimeoutExpired:
                         pass
+                    now = time.time()
+                    if self.stopping:
+                        # Asked to stop: a child that has not gone after ten seconds is killed outright.
+                        stop_seen = stop_seen or now
+                        if now - stop_seen > 10:
+                            self.finish_off(self.stopped_pids + [child.pid], grace=0)
+                        continue
+                    if killed_at and now - killed_at > 30:
+                        self.finish_off(stalled_pids, grace=0)
+                    elif stall and not killed_at and now - checked >= min(60, stall):
+                        checked = now
+                        try:
+                            # A chunk script's own log is no sign of life: GNU parallel redraws its progress
+                            # bar there every second. The logs of the chunks themselves are what count.
+                            newest = max(activity(), started) if activity else os.path.getmtime(log_path)
+                        except OSError:
+                            newest = now
+                        if now - newest >= stall and self.lost_connection(conf):
+                            note = (f"FATAL: dataload: stalled. Nothing was written for {human(now - newest)} and neither "
+                                    "Oracle nor PostgreSQL is working on this load: the connection was lost. Stopped.")
+                            with open(log_path, "a") as f:
+                                f.write(f"\n{note}\n")
+                            self.log(f"{label or argv[0]}: {note[7:]}")
+                            killed_at = now
+                            stalled_pids = self.kill_tree([child.pid])
                     if label and self.cfg.heartbeat and time.time() - beat >= self.cfg.heartbeat:
                         beat = time.time()
                         detail = progress() if progress else last_output_line(log_path)
@@ -172,6 +266,9 @@ class Engine:
                                  + (f" | {detail}" if detail else ""))
             finally:
                 self._reap(child)
+                if stalled_pids:
+                    self.finish_off(stalled_pids, grace=5)
+                shutil.rmtree(private_tmp, ignore_errors=True)
         if self.stopping:
             raise Stopped()
         return rc
@@ -459,6 +556,9 @@ class Engine:
         self.log(f"preflight passed, target {self.target}")
 
         resumed = state.begin(self.target)
+        state.set_flags(self.flags.skipped)
+        if self.flags.skipped:
+            self.log("phases skipped by flag: " + ", ".join(sorted(self.flags.skipped)))
         state.recover_interrupted()
         state.sync(steps)
         if resumed:
@@ -476,6 +576,9 @@ class Engine:
                        or self.phase_recreate() or "")
             mismatches = [] if blocked else self.phase_validate(loads)
         except Stopped:
+            left = self.finish_off(self.stopped_pids)
+            if left:
+                self.log(f"{len(left)} process(es) did not stop when asked and were killed")
             self.write_report()
             self.log("stopped by signal; nothing is lost, run 'resume' to continue")
             return 130
@@ -506,13 +609,21 @@ class Engine:
         for phase in ("drop", "load", "recreate"):
             c = self.state.counts("s.phase = ?", (phase,))
             total = sum(c.values())
-            if total:
-                failed = sum(n for s, n in c.items() if s not in ("done", "pending"))
-                lines.append(f"{phase:9} {c.get('done', 0)}/{total} done, {failed} failed, {c.get('pending', 0)} not started")
+            if not total:
+                continue
+            if phase in self.flags.skipped:
+                lines.append(f"{phase:9} skipped by flag")
+                continue
+            stopped = c.get("interrupted", 0) + c.get("running", 0)
+            lines.append(f"{phase:9} {c.get('done', 0):,} of {total:,} done, {c.get('failed', 0):,} failed"
+                         + (f", {stopped:,} stopped part-way (redone on resume)" if stopped else "")
+                         + (f", {c['pending']:,} not started" if c.get("pending") else ""))
         return "\n".join(lines)
 
     def describe(self, units, limit=30):
-        lines = [f"- {u['step_id']} :: {u['key'][:120]}\n    {u['error'] or u['status']}" for u in units[:limit]]
+        # This text is mailed, so values quoted by the database are hidden; the logs keep the full error.
+        hide = redact if self.cfg.hide_values else (lambda text: text)
+        lines = [f"- {u['step_id']} :: {u['key'][:120]}\n    {hide(u['error']) or u['status']}" for u in units[:limit]]
         if len(units) > limit:
             lines.append(f"... and {len(units) - limit} more, see 'status --failed'")
         return "\n".join(lines)
@@ -531,7 +642,7 @@ class Engine:
 
     def phase_finished(self, phase, started):
         c = self.state.counts("s.phase = ?", (phase,))
-        failed = sum(n for s, n in c.items() if s not in ("done", "pending"))
+        failed = c.get("failed", 0)
         minutes = (time.time() - started) / 60
         self.log(f"phase {phase} finished in {minutes:.1f} min: {c.get('done', 0)} done, {failed} failed")
         self.write_report()
@@ -554,7 +665,7 @@ class Engine:
         for sp in specs:
             r = results[sp.key]
             if r["ora"] is None or r["pg"] is None:
-                missing.append(f"{sp.name}: {r['error']}")
+                missing.append(f"{sp.name}: {redact(r['error']) if self.cfg.hide_values else r['error']}")
                 continue
             self.state.set_before(sp.step_id, sp.table, sp.schema, sp.filter, r["ora"], r["pg"], r["ora_bytes"], r["pg_bytes"])
         rows = self.state.snapshots()
@@ -627,6 +738,15 @@ class Engine:
         todo = [s for s in loads if self.state.units(s.id, only_unfinished=True)]
         if not todo:
             return
+        rc, out, _ = self.psql("SELECT pid || ' (' || left(query, 60) || ')' FROM pg_stat_activity "
+                               "WHERE datname = current_database() AND pid <> pg_backend_pid() "
+                               "AND state = 'active' AND query ~* '^\\s*COPY\\s'")
+        if rc == 0 and out:
+            reason = (f"{len(out.splitlines())} session(s) are already copying data into this database: "
+                      f"{', '.join(out.splitlines()[:3])}. They are probably left from a run that was killed, and "
+                      "loading beside them would duplicate rows. Wait for them or stop them, then run 'resume'.")
+            self.log(f"load NOT started: {reason}")
+            return reason
         if any(s.kind == "conf" for s in todo) and not self.flags.allow_remaining_fks:
             truncated = ['"%s"."%s"' % (OraConf(s.conf_path).pg_schema(), u["key"].lower())
                          for s in todo if s.kind == "conf"
@@ -776,7 +896,7 @@ class Engine:
                  f"(ora2pg TEST_COUNT), log {log_path}")
         started = time.time()
         rc = self.exec_logged([self.cfg.ora2pg, "-t", "TEST_COUNT", "-c", str(conf)], step.conf_path.parent, log_path,
-                              label=f"{step.id} row count")
+                              label=f"{step.id} row count", conf=OraConf(step.conf_path))
         counts = parse_test_count(log_path.read_text(errors="replace"))
         if rc != 0 or not counts:
             self.log(f"{step.id}: TEST_COUNT gave no usable counts (exit {rc}), see {log_path}")
@@ -799,7 +919,7 @@ class Engine:
             self.log(f"{step.id}: copying {len(todo)} table(s) with ora2pg ({shown}), log {log_path}")
             started = time.time()
             rc = self.exec_logged([self.cfg.ora2pg, "-c", str(conf)], step.conf_path.parent, log_path,
-                                  label=f"{step.id} copy")
+                                  label=f"{step.id} copy", conf=OraConf(step.conf_path))
             text = log_path.read_text(errors="replace")
             error = first_error(text) or (f"ora2pg exit code {rc}" if rc != 0 else "")
             self.log(f"{step.id}: copy ended after {human(time.time() - started)}"
@@ -841,8 +961,37 @@ class Engine:
             self.log(f"{step.id}: {failed} table(s) failed on a transient error, retry {attempt + 1}/{self.cfg.attempts}")
             self.sleep(self.cfg.backoff_seconds * attempt)
 
+    def record_finished_chunks(self, step, log_path, statuses=("running",)):
+        """A chunk is done the moment the script reports it, not when the whole script ends, so a stop
+        or a crash part-way through costs only the chunks that were still copying."""
+        try:
+            with open(log_path, errors="replace") as f:
+                finished, _ = parse_chunk_output(f.read())
+        except (OSError, TypeError):
+            return
+        for u in self.state.units(step.id, only_unfinished=True):
+            if u["key"] in finished and u["status"] in statuses:
+                self.state.set_unit(step.id, u["key"], "done")
+
+    def chunk_rows_match(self, step, key):
+        """ora2pg can report an error for a chunk whose rows all arrived. The rows decide."""
+        if self.cfg.validate_method != "direct":
+            return False
+        spec = self.specs_for(step)[0]
+        spec.filter = f"({key})"
+        r = self.measure([spec], sizes=False, label=f"{step.id} chunk check")[spec.key]
+        if r["ora"] is None or r["ora"] != r["pg"]:
+            return False
+        self.log(f"{step.id}: the script reported a failure for chunk [{key}], but Oracle and PostgreSQL both hold "
+                 f"{r['ora']:,} rows in that range, so it is counted as done")
+        return True
+
     def run_chunk_step(self, step):
         qualified = '"%s"."%s"' % (OraConf(step.conf_path).pg_schema(), step.table.lower())
+        # After a kill that left no time to record anything, the last log still says which chunks finished.
+        last_log = next((s["log"] for s in self.state.steps("load") if s["id"] == step.id), None)
+        if last_log:
+            self.record_finished_chunks(step, last_log, statuses=("interrupted",))
         retry_only = None
         for attempt in range(1, self.cfg.attempts + 1):
             units = self.state.units(step.id, only_unfinished=True)
@@ -870,12 +1019,20 @@ class Engine:
             started = time.time()
 
             def progress():
+                self.record_finished_chunks(step, log_path)
                 finished, broken = parse_chunk_output(log_path.read_text(errors="replace"))
                 return f"{len(finished)} of {len(todo)} chunks finished, {len(broken)} failed"
 
-            self.exec_logged(["bash", step.path.name], step.path.parent, log_path,
-                             env={"CHUNKS_FILE": str(remaining), "SHELL": shutil.which("bash") or "/bin/bash"},
-                             label=step.id, progress=progress)
+            def chunk_logs():   # each chunk writes its own log under the script's folder
+                times = [f.stat().st_mtime for f in step.path.parent.glob("migration_logs*/*") if f.is_file()]
+                return max(times, default=0)
+
+            try:
+                self.exec_logged(["bash", step.path.name], step.path.parent, log_path,
+                                 env={"CHUNKS_FILE": str(remaining), "SHELL": shutil.which("bash") or "/bin/bash"},
+                                 label=step.id, progress=progress, conf=OraConf(step.conf_path), activity=chunk_logs)
+            finally:
+                self.record_finished_chunks(step, log_path)
             done, failed = parse_chunk_output(log_path.read_text(errors="replace"))
             self.log(f"{step.id}: script ended after {human(time.time() - started)}: "
                      f"{len(done & set(todo))} of {len(todo)} chunks finished")
@@ -885,12 +1042,18 @@ class Engine:
                 if key in done:
                     self.state.set_unit(step.id, key, "done")
                     continue
+                if self.chunk_rows_match(step, key):
+                    self.state.set_unit(step.id, key, "done")
+                    continue
                 chunk_log = step.path.parent / failed[key] if key in failed else None
                 detail = chunk_log.read_text(errors="replace") if chunk_log and chunk_log.exists() else ""
                 error = first_error(detail) or ("chunk failed, see " + str(chunk_log) if chunk_log
                                                 else "script reported no result for this chunk")
+                stalled = "dataload: stalled" in log_path.read_text(errors="replace") and key not in failed
+                if stalled:
+                    error = "the connection was lost while this chunk was copying (no progress, both databases idle)"
                 self.state.set_unit(step.id, key, "failed", error=error)
-                if self.is_transient(detail):
+                if stalled or self.is_transient(detail):
                     retry_only.add(key)
             if not retry_only or attempt == self.cfg.attempts:
                 return

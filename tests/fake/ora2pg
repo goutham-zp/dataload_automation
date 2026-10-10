@@ -3,13 +3,15 @@
 
 "Oracle" is a JSON file (FAKE_ORA_SOURCE) of {"SCHEMA.TABLE": row_count}; rows are ids 1..n.
 Faults come from a JSON list (FAKE_ORA_FAULTS) of {"match", "mode", "times"} where match is a
-table name or part of a --where condition, and mode is transient | fatal | exit0 | hang.
+table name or part of a --where condition, and mode is transient | fatal | exit0 | hang | stubborn | falsefail.
 """
 import fcntl
 import json
 import os
+import signal
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -69,6 +71,20 @@ def main():
             print(f"POSTGRES:{t.lower()}:" + psql(conf, f'SELECT count(*) FROM "{pg_schema}"."{t.lower()}"'))
         return 0
 
+    # Like the real ora2pg: a tmp_ora2pg* file lives in the temp directory while data is copied, and
+    # finding any such file at the end (its own or another process's) is reported as an error.
+    marker = tempfile.NamedTemporaryFile(prefix="tmp_ora2pg", delete=False)
+    status = copy_tables(conf, opts, tables, source, schema, pg_schema)
+    if status == 0:
+        os.unlink(marker.name)
+        time.sleep(0.3)
+        if [f for f in os.listdir(tempfile.gettempdir()) if f.startswith("tmp_ora2pg")]:
+            print("WARNING: an error occurs during data export. Please check what's happen.")
+            return 2
+    return status
+
+
+def copy_tables(conf, opts, tables, source, schema, pg_schema):
     for t in tables:
         where = opts["--where"]
         with open(os.environ["FAKE_ORA_CALLS"], "a") as f:
@@ -78,7 +94,7 @@ def main():
         if conf.get("TRUNCATE_TABLE") == "1":
             psql(conf, f"TRUNCATE {target} CASCADE")
         rows = source.get(f"{schema}.{t}", 0)
-        partial = " AND id % 2 = 0" if mode else ""
+        partial = " AND id % 2 = 0" if mode and mode != "falsefail" else ""
         if rows:
             psql(conf, f"INSERT INTO {target} (id) SELECT id FROM generate_series(1, {rows}) "
                        f"AS g(id) WHERE ({where or 'TRUE'}){partial}")
@@ -88,12 +104,17 @@ def main():
             print("Aborting export...")
             return 1
         if mode == "fatal":
-            print('FATAL: ERROR:  duplicate key value violates unique constraint "x_pkey"')
+            print('FATAL: ERROR:  duplicate key value violates unique constraint "x_pkey" DETAIL:  Key (id)=(4471882) already exists.')
             print("Aborting export...")
             return 1
+        if mode == "falsefail":   # every row arrived, and ora2pg still says it failed
+            print("WARNING: an error occurs during data export. Please check what's happen.")
+            return 2
         if mode == "exit0":
             print("WARNING: an error occurs during data export. Please check what's happen.")
-        if mode == "hang":
+        if mode == "stubborn":    # like an ora2pg reader in the middle of a fetch: deaf to a polite stop
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if mode in ("hang", "stubborn"):
             sys.stdout.flush()
             time.sleep(600)
     return 0

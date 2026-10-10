@@ -43,6 +43,8 @@ class State:
             # Added after the first version; a state file from before it gets the column here.
             if "pg_bytes_loaded" not in [c[1] for c in self.db.execute("PRAGMA table_info(snapshot)")]:
                 self.db.execute("ALTER TABLE snapshot ADD COLUMN pg_bytes_loaded INTEGER")
+            if "flags" not in [c[1] for c in self.db.execute("PRAGMA table_info(run)")]:
+                self.db.execute("ALTER TABLE run ADD COLUMN flags TEXT")
 
     def _exec(self, sql, args=()):
         with self.lock, self.db:
@@ -56,6 +58,14 @@ class State:
             return False
         self._exec("UPDATE run SET invocations = invocations + 1, finished = NULL WHERE id = 1")
         return True
+
+    def set_flags(self, skipped):
+        """The phases this run skips, kept so that a resume continues the same way."""
+        self._exec("UPDATE run SET flags = ? WHERE id = 1", (",".join(sorted(skipped)),))
+
+    def skipped(self):
+        info = self.run_info()
+        return set(filter(None, ((info["flags"] if info else "") or "").split(",")))
 
     def finish(self):
         self._exec("UPDATE run SET finished = ? WHERE id = 1", (now(),))
@@ -100,6 +110,8 @@ class State:
         )
 
     def reset_step(self, step_id):
+        # The log is forgotten too, so chunks it reports as finished are not taken as done again.
+        self._exec("UPDATE step SET log = NULL WHERE id = ?", (step_id,))
         return self._exec(
             "UPDATE unit SET status = 'interrupted', error = NULL WHERE step_id = ?", (step_id,)
         )
@@ -119,10 +131,12 @@ class State:
             return self._exec("SELECT * FROM step WHERE phase = ? ORDER BY seq", (phase,))
         return self._exec("SELECT * FROM step ORDER BY seq")
 
-    def failed_units(self, step_id=None, phase=None):
-        sql = ("SELECT u.*, s.phase, s.log FROM unit u JOIN step s ON s.id = u.step_id "
-               "WHERE u.status NOT IN ('done', 'pending')")
-        args = []
+    def failed_units(self, step_id=None, phase=None, statuses=("failed",)):
+        """Units that ended in an error. A unit cut off by a stop is 'interrupted', which is not a failure:
+        pass other statuses to list those."""
+        sql = ("SELECT u.*, s.phase, s.kind, s.log FROM unit u JOIN step s ON s.id = u.step_id "
+               f"WHERE u.status IN ({', '.join('?' * len(statuses))})")
+        args = list(statuses)
         if step_id:
             sql += " AND u.step_id = ?"
             args.append(step_id)

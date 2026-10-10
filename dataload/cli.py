@@ -1,8 +1,10 @@
 """Command line: plan, preflight, run, resume, status, retry."""
 import argparse
 import fcntl
+import os
 import sys
 from datetime import datetime
+from pathlib import Path
 
 from . import config, plan
 from .conf import OraConf
@@ -22,17 +24,24 @@ def add_run_flags(p):
                    help="do not recreate constraints and indexes after the load")
     p.add_argument("--skip-load", action="store_true")
     p.add_argument("--skip-validate", action="store_true")
+    p.add_argument("--no-skip", action="store_true",
+                   help="on resume: run every phase, forgetting the skip flags the run was started with")
     p.add_argument("--force-recreate", action="store_true",
                    help="recreate constraints and indexes even if some load units are not done")
     p.add_argument("--allow-remaining-fks", action="store_true",
                    help="DANGEROUS: load even though foreign keys still reference the tables (TRUNCATE CASCADE)")
 
 
-def flags_from(args):
-    return Flags(skip_drop=set(KINDS) if args.skip_constraints or args.skip_drop else set(),
-                 skip_recreate=set(KINDS) if args.skip_constraints or args.skip_recreate else set(),
-                 skip_load=args.skip_load,
-                 skip_validate=args.skip_validate, force_recreate=args.force_recreate,
+def skips_from(args):
+    names = {"drop", "recreate"} if args.skip_constraints else set()
+    return names | {name for name in ("drop", "recreate", "load", "validate") if getattr(args, f"skip_{name}")}
+
+
+def flags_from(args, skipped):
+    return Flags(skip_drop=set(KINDS) if "drop" in skipped else set(),
+                 skip_recreate=set(KINDS) if "recreate" in skipped else set(),
+                 skip_load="load" in skipped, skipped=set(skipped),
+                 skip_validate="validate" in skipped, force_recreate=args.force_recreate,
                  allow_remaining_fks=args.allow_remaining_fks)
 
 
@@ -57,9 +66,6 @@ def cmd_status(cfg, args):
         return 0
     state = State(cfg.state)
     info = state.run_info()
-    if info:
-        print(f"Target {info['target']}  started {info['started']}  finished {info['finished'] or '-'}  "
-              f"invocations {info['invocations']}")
     if args.counts:
         rows = state.snapshots()
         print(f"\n{'table':44} {'oracle before':>15} {'pg before':>15} {'oracle after':>15} {'pg after':>15}")
@@ -73,22 +79,106 @@ def cmd_status(cfg, args):
         checked = sum(1 for r in rows if r["ora_after"] is not None)
         print(f"\n{len(rows)} table(s), {checked} compared after the load, {different} different")
         return 0
-    for row in state.steps():
-        c = state.counts("s.id = ?", (row["id"],))
-        total = sum(c.values())
-        failed = sum(n for s, n in c.items() if s not in ("done", "pending", "running"))
-        if args.failed and not failed:
-            continue
-        label = "done" if c.get("done", 0) == total else ("FAILED" if failed else
-                                                          ("running" if c.get("running") else "pending"))
-        print(f"{row['phase']:9} {row['id']:60} {c.get('done', 0):5}/{total:<5} {label}"
-              + (f"  ({failed} failed)" if failed else ""))
+    skipped = state.skipped()
+    active = run_is_active(cfg)
+    finished = bool(info and info["finished"])
+    if info:
+        when = (f"finished {info['finished']}" if finished else
+                "running now" if active else "not running (it stopped before the end)")
+        print(f"Target    {info['target']}")
+        print(f"Started   {info['started']}, {when}, started {info['invocations']} time(s)")
+        if skipped:
+            print("Flags     " + " ".join(f"--skip-{name}" for name in sorted(skipped)))
+
+    def tally(where, args_):
+        c = state.counts(where, args_)
+        cut_off = c.get("interrupted", 0) + (0 if active else c.get("running", 0))
+        return sum(c.values()), c.get("done", 0), c.get("failed", 0), c.get("running", 0) if active else 0, cut_off
+
+    def describe(total, done, failed, running, cut_off, skip=False):
+        if failed:
+            return f"{failed:,} FAILED"
+        if total and done == total:
+            return "done"
+        if skip:
+            return "skipped by flag"
+        if running:
+            return "running"
+        return "stopped part-way" if done or cut_off else "not started"
+
+    steps = state.steps()
+    if not args.failed:
+        print(f"\n{'Phase':10} {'Done':>9}   {'Total':<9} State")
+        for phase in ("drop", "load", "recreate"):
+            numbers = tally("s.phase = ?", (phase,))
+            if numbers[0]:
+                print(f"{phase:10} {numbers[1]:>9,} / {numbers[0]:<9,} {describe(*numbers, skip=phase in skipped)}")
+        print("\nLoad steps")
+        for row in steps:
+            numbers = tally("s.id = ?", (row["id"],))
+            what = "chunks" if row["kind"] == "chunk" else "tables" if row["kind"] == "conf" else "statements"
+            # Drop and recreate have dozens of steps each; only the ones needing attention are listed.
+            if row["phase"] == "load" or args.all or numbers[2]:
+                print(f"  {row['id']:58} {numbers[1]:>6,} / {numbers[0]:<6,} {what:10} "
+                      f"{describe(*numbers, skip=row['phase'] in skipped)}")
+
+    WORD = {"chunk": "chunk", "conf": "table", "sql": "statement"}
+
+    def grouped(units):
+        by_step = {}
+        for u in units:
+            by_step.setdefault(u["step_id"], []).append(u)
+        return by_step
+
     failed = state.failed_units()
     if failed:
-        print(f"\n{len(failed)} unit(s) not done after an attempt:")
-        for u in failed[: None if args.failed else 20]:
-            print(f"- {u['step_id']} :: {u['key'][:100]}\n    [{u['status']}] {u['error'] or ''}\n    log: {u['log']}")
+        print(f"\nFailed ({len(failed)}): fix the cause, then run 'resume'")
+        limit = None if args.failed else 5
+        for step_id, units in grouped(failed).items():
+            print(f"  {step_id}")
+            for u in units[:limit]:
+                print(f"    {WORD[u['kind']] + ':':10} {u['key'][:110]}")
+                print(f"    {'error:':10} {(u['error'] or 'no message recorded')[:300]}")
+            if limit and len(units) > limit:
+                print(f"    ... and {len(units) - limit} more in this step ('status --failed' lists all)")
+            print(f"    {'log:':10} {units[0]['log']}")
+
+    cut_off = state.failed_units(statuses=("interrupted",) if active else ("interrupted", "running"))
+    if cut_off and not args.failed:
+        print(f"\nStopped part-way ({len(cut_off)}): nothing to fix, 'resume' does these again")
+        for step_id, units in grouped(cut_off).items():
+            note = "  (its phase is skipped by flag, so it is left as it is)" if units[0]["phase"] in skipped else ""
+            print(f"  {step_id}: {len(units)} {WORD[units[0]['kind']]}(s){note}")
+
+    running = state.failed_units(statuses=("running",)) if active else []
+    if running and not args.failed:
+        print(f"\nRunning now ({len(running)})")
+        for step_id, units in grouped(running).items():
+            print(f"  {step_id}: {len(units)} {WORD[units[0]['kind']]}(s), log {units[0]['log']}")
+
+    if not args.failed:
+        left = sum(n for status, n in state.counts().items() if status != "done")
+        if active:
+            print("\nA run is in progress.")
+        elif failed:
+            print("\nNext: fix the failures above, then run 'python3 -m dataload resume'.")
+        elif finished and not cut_off:
+            print("\nNothing is waiting." if not left else "\nThe last start finished; the skipped phases were not run.")
+        else:
+            print("\nNext: 'python3 -m dataload resume' continues from here.")
     return 0
+
+
+def run_is_active(cfg):
+    """True while a run or resume holds the lock on the state file."""
+    try:
+        with open(str(cfg.state) + ".lock", "a") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return False
+    except BlockingIOError:
+        return True
+    except OSError:
+        return False
 
 
 def cmd_report(cfg, _args):
@@ -133,7 +223,14 @@ def cmd_run(cfg, args):
     if args.command == "resume" and not recorded:
         print("nothing to resume; use 'run'")
         return 2
-    return Engine(cfg, State(cfg.state), flags_from(args)).run()
+    state = State(cfg.state)
+    skipped = skips_from(args)
+    if args.command == "resume" and not skipped and not args.no_skip and state.skipped():
+        # A resume continues the run as it was started unless told otherwise.
+        skipped = state.skipped()
+        print("continuing with the flags this run was started with: "
+              + " ".join(f"--skip-{name}" for name in sorted(skipped)) + "  (--no-skip runs every phase)")
+    return Engine(cfg, state, flags_from(args, skipped)).run()
 
 
 def cmd_preflight(cfg, _args):
@@ -164,12 +261,23 @@ def main(argv=None):
     add_run_flags(sub.add_parser("resume", help="continue the recorded run, doing only what is not done"))
     status = sub.add_parser("status", help="show progress")
     status.add_argument("--failed", action="store_true", help="only steps with failures, all failed units")
+    status.add_argument("--all", action="store_true", help="list every drop and recreate step too")
     status.add_argument("--counts", action="store_true", help="Oracle and PostgreSQL row counts per table")
     sub.add_parser("report", help="write the HTML report again from the recorded run")
     retry = sub.add_parser("retry", help="mark a whole step to run again on the next resume")
     retry.add_argument("step")
     args = parser.parse_args(argv)
 
+    try:
+        os.getcwd()
+    except FileNotFoundError:
+        print("The folder this shell is in no longer exists (it was deleted or rebuilt). "
+              "Change into it again, for example: cd \"$PWD\"")
+        return 2
+    if not Path(args.config).is_file():
+        print(f"Settings file not found: {Path(args.config).resolve()}\n"
+              "Run this from the folder that holds dataload.toml, or pass --config PATH before the command.")
+        return 2
     cfg = config.load(args.config)
     cfg.only = [name.upper() for name in args.only]
     try:

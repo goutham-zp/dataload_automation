@@ -14,6 +14,7 @@ DEFAULT_TRANSIENT = [
     r"could not connect to server",
     r"connection to server .* failed",
     r"deadlock detected",
+    r"dataload: stalled",              # written by this tool when it stops a copy that lost its connection
 ]
 
 DROP_ORDER = ["FK", "PK", "Other", "indexes"]
@@ -35,6 +36,7 @@ class Config:
     only: list = field(default_factory=list)
     attempts: int = 3
     backoff_seconds: int = 30
+    stall_minutes: float = 15
     transient: list = field(default_factory=lambda: list(DEFAULT_TRANSIENT))
     recreate_workers: int = 4
     validate_method: str = "direct"
@@ -44,6 +46,7 @@ class Config:
     validate_ignore: list = field(default_factory=list)
     check_perl_dbd_pg: bool = True
     heartbeat: int = 60
+    hide_values: bool = True
     email: dict = field(default_factory=dict)
 
 
@@ -86,6 +89,7 @@ def load(path):
         exclude=[e.upper() for e in raw.get("order", {}).get("exclude", [])],
         attempts=int(retry.get("attempts", 3)),
         backoff_seconds=int(retry.get("backoff_seconds", 30)),
+        stall_minutes=float(retry.get("stall_minutes", 15)),
         transient=retry.get("transient_patterns", list(DEFAULT_TRANSIENT)),
         recreate_workers=int(raw.get("recreate", {}).get("workers", 4)),
         validate_method=validate.get("method", "direct"),
@@ -95,5 +99,6 @@ def load(path):
         validate_ignore=[t.upper() for t in validate.get("ignore", [])],
         check_perl_dbd_pg=bool(raw.get("preflight", {}).get("perl_dbd_pg", True)),
         heartbeat=int(raw.get("output", {}).get("heartbeat_seconds", 60)),
+        hide_values=bool(raw.get("output", {}).get("hide_values", True)),
         email=raw.get("email", {}),
     )

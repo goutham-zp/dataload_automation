@@ -6,6 +6,7 @@ from datetime import datetime
 from html import escape
 
 from .counts import human_bytes
+from .redact import redact
 
 CSS = """
 :root { --ink:#1c2430; --muted:#5f6b7a; --line:#dfe4ea; --bg:#f5f7fa; --card:#ffffff; --head:#17324d;
@@ -79,13 +80,13 @@ def table_rows(state):
         if chunked:
             done = sum(1 for u in step_units if u["status"] == "done")
             how = f"{len(step_units)} chunks"
-            failed = [u for u in step_units if u["status"] not in ("done", "pending")]
+            failed = [u for u in step_units if u["status"] == "failed"]
             finished = bool(step_units) and done == len(step_units)
             progress = f"{done} of {len(step_units)} chunks loaded"
         else:
             unit = next((u for u in step_units if u["key"].upper() == snap["tbl"]), None)
             how = "filtered" if snap["filter"] else "whole table"
-            failed = [unit] if unit and unit["status"] not in ("done", "pending") else []
+            failed = [unit] if unit and unit["status"] == "failed" else []
             finished = bool(unit) and unit["status"] == "done"
             progress = "not loaded yet"
         ora, pg = snap["ora_after"], snap["pg_after"]
@@ -107,6 +108,7 @@ def table_rows(state):
 def build(state, cfg, target, source):
     info = state.run_info()
     rows = table_rows(state)
+    hide = redact if cfg.hide_values else (lambda text: text)
     failed_units = state.failed_units()
     matched = sum(1 for r in rows if r["kind"] == "ok")
     bad = sum(1 for r in rows if r["kind"] == "bad")
@@ -147,10 +149,15 @@ def build(state, cfg, target, source):
         count_all = sum(c.values())
         if not count_all:
             continue
-        done, pending = c.get("done", 0), c.get("pending", 0)
-        failed = count_all - done - pending
-        state_pill = pill("bad", f"{failed} failed") if failed else (
-            pill("ok", "Done") if done == count_all else pill("wait", "Not finished"))
+        done, failed = c.get("done", 0), c.get("failed", 0)
+        if failed:
+            state_pill = pill("bad", f"{failed} failed")
+        elif done == count_all:
+            state_pill = pill("ok", "Done")
+        elif phase in state.skipped():
+            state_pill = '<span class="muted">Skipped for this run</span>'
+        else:
+            state_pill = pill("wait", "Not finished")
         phases.append(f"<tr><td>{label}</td><td class=n>{num(done)}</td><td class=n>{num(count_all)}</td>"
                       f"<td class=n>{num(failed)}</td><td>{state_pill}</td></tr>")
 
@@ -172,11 +179,11 @@ def build(state, cfg, target, source):
             f'<td>{pill(r["kind"], r["result"])}</td><td class="muted small">{escape(s["after_at"] or "")}</td></tr>')
 
     issues = [f"<li><strong>{escape(r['snap']['schema'])}.{escape(r['snap']['tbl'])}</strong>: "
-              f"{escape(r['result'])}{' &mdash; ' + escape(r['error'][:300]) if r['error'] else ''}</li>"
+              f"{escape(r['result'])}{' &mdash; ' + escape(hide(r['error'])[:300]) if r['error'] else ''}</li>"
               for r in rows if r["kind"] == "bad"]
     other = [u for u in failed_units if u["phase"] != "load"]
     issues += [f"<li>{escape(u['phase'])} step <code>{escape(u['step_id'])}</code>: <code>{escape(u['key'][:140])}</code>"
-               f" &mdash; {escape((u['error'] or u['status'])[:300])}</li>" for u in other[:40]]
+               f" &mdash; {escape(hide(u['error'] or u['status'])[:300])}</li>" for u in other[:40]]
     if len(other) > 40:
         issues.append(f"<li>and {len(other) - 40} more failed statements; see <code>status --failed</code></li>")
 

@@ -24,6 +24,11 @@ attempts = 3                   # per invocation, for errors that look transient
 backoff_seconds = 30           # wait = backoff_seconds x attempt number
 # transient_patterns = ["ORA-08177", ...]   # regexes; defaults are in dataload/config.py
 
+# A copy that writes nothing to its logs for this long is checked: if Oracle is running no statement for
+# this account and PostgreSQL is receiving nothing, the connection was lost without an error (ora2pg would
+# wait forever), so the copy is stopped and retried. A slow but working query is never stopped. 0 = off.
+# stall_minutes = 15            # put this line in [retry] above to change it
+
 [recreate]
 workers = 4                    # statements in parallel (foreign keys always run one at a time)
 
@@ -44,6 +49,9 @@ perl_dbd_pg = true
 
 [output]
 heartbeat_seconds = 60         # a "still running" line this often while a step works; 0 = off
+# Database errors can quote the row that failed. Emails and the HTML report get the error with such values
+# replaced by ***; the full text stays in the logs and in 'status --failed' on this machine.
+hide_values = true
 
 [email]
 enabled = false                # set true once .env has the Brevo login and key

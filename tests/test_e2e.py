@@ -265,6 +265,12 @@ outbox = "outbox"
         self.assertEqual(subjects[-1], "Run finished: NEEDS ATTENTION")
         self.assertEqual(self.dataload("status", "--failed"), 0)
         self.assertIn("duplicate key", self.output)
+        self.assertIn("Key (id)=(4471882) already exists", self.output, "the full error stays on the machine")
+        mailed = "".join(f.read_text() for f in (self.tmp / "outbox").glob("*.txt"))
+        self.assertIn("duplicate key", mailed)
+        self.assertIn("Key (id)=(***) already exists", mailed)
+        self.assertNotIn("4471882", mailed)
+        self.assertNotIn("4471882", (self.tmp / "report.html").read_text())
 
         self.set_faults([])
         self.calls.write_text("")
@@ -297,13 +303,109 @@ outbox = "outbox"
         self.assertGreater(self.count("alpha.big"), 0)
         self.assertEqual(self.dataload("resume"), 0, self.output)
         self.assert_everything_loaded()
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("|ID BETWEEN 51 AND 75"), 2, "the interrupted chunk runs again")
+        self.assertEqual(calls.count("BIG|"), 5, "chunks that had finished before the stop are not repeated")
+
+    def test_status_tells_a_stop_from_a_failure(self):
+        self.set_faults([{"match": "T2", "mode": "fatal", "times": 99},
+                         {"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])
+        proc = subprocess.Popen(self.argv("run"), env=self.env, cwd=self.tmp, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 60
+        while "ID BETWEEN 51 AND 75" not in self.calls.read_text() and time.time() < deadline:
+            time.sleep(0.2)
+        time.sleep(1)
+        self.dataload("status")
+        self.assertIn("running now", self.output)
+        self.assertRegex(self.output, r"Running now \(\d\)\n  ALPHA/BIG/run_BIG.sh: \d chunk\(s\), log ")
+        proc.send_signal(signal.SIGINT)
+        proc.communicate(timeout=60)
+        self.dataload("status")
+        self.assertIn("not running (it stopped before the end)", self.output)
+        self.assertIn("Failed (1): fix the cause, then run 'resume'\n  ALPHA/ora2pg_set_1.conf\n    table:     T2", self.output)
+        self.assertIn("Stopped part-way (1): nothing to fix, 'resume' does these again\n  ALPHA/BIG/run_BIG.sh: 1 chunk(s)",
+                      self.output)
+        self.assertIn("Next: fix the failures above", self.output)
+        outbox = "".join(f.read_text() for f in (self.tmp / "outbox").glob("*.txt"))
+        self.assertNotIn("stopped part-way", outbox, "nothing was mailed after the stop")
+        self.set_faults([])
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.dataload("status")
+        self.assertIn("Nothing is waiting.", self.output)
+
+    def test_copy_that_lost_its_connection_is_stopped_and_retried(self):
+        toml = self.tmp / "dataload.toml"
+        toml.write_text(toml.read_text().replace("backoff_seconds = 0", "backoff_seconds = 0\nstall_minutes = 0.05"))
+        self.set_faults([{"match": "T3", "mode": "hang", "times": 1},
+                         {"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assertIn("ALPHA/ora2pg_set_2.conf copy: dataload: stalled.", self.output)
+        self.assertIn("ALPHA/BIG/run_BIG.sh: dataload: stalled.", self.output)
+        self.assertIn("retry 2/3", self.output)
+        self.assert_everything_loaded()
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("T3|"), 2)
+        self.assertEqual(calls.count("BIG|"), 5, "only the stalled chunk is copied again")
+        left = subprocess.run(["pgrep", "-fl", str(self.tmp)], capture_output=True, text=True).stdout
+        self.assertEqual(left, "")
+
+    def test_stop_leaves_no_loader_process_behind(self):
+        # T3 stands for an ora2pg reader in the middle of a fetch, which does not act on a polite stop.
+        self.set_faults([{"match": "T3", "mode": "stubborn", "times": 1}])
+        proc = subprocess.Popen(self.argv("run"), env=self.env, cwd=self.tmp, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 60
+        while "T3|" not in self.calls.read_text() and time.time() < deadline:
+            time.sleep(0.2)
+        time.sleep(1)
+        proc.send_signal(signal.SIGINT)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, out)
+        left = subprocess.run(["pgrep", "-fl", str(self.tmp)], capture_output=True, text=True).stdout
+        self.assertEqual(left, "", "nothing may keep copying after a stop")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_chunk_reported_failed_but_fully_loaded_counts_as_done(self):
+        self.set_faults([{"match": "ID BETWEEN 26 AND 50", "mode": "falsefail", "times": 1}])
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assertIn("both hold 25 rows in that range, so it is counted as done", self.output)
+        self.assertEqual(self.loaded_tables().count("BIG"), 4, "the chunk is not loaded a second time")
+        self.assert_everything_loaded()
+
+    def test_hard_kill_mid_chunk_keeps_the_chunks_that_finished(self):
+        self.set_faults([{"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])
+        proc = subprocess.Popen(self.argv("run"), env=self.env, cwd=self.tmp, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        log = None
+        deadline = time.time() + 60
+        while time.time() < deadline:   # wait until the three other chunks are reported as finished
+            logs = list((self.tmp / "logs").glob("ALPHA__BIG__run_BIG.sh.*.log")) if (self.tmp / "logs").exists() else []
+            if logs and logs[0].read_text(errors="replace").count("[SUCCESS] Finished") == 3:
+                log = logs[0]
+                break
+            time.sleep(0.2)
+        self.assertIsNotNone(log, "the other chunks never finished")
+        proc.kill()                     # SIGKILL: the tool gets no chance to record anything
+        proc.communicate(timeout=60)
+        subprocess.run(["pkill", "-f", str(self.tmp)])  # the orphaned hanging chunk
+        time.sleep(1)
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("|ID BETWEEN 51 AND 75"), 2)
+        self.assertEqual(calls.count("BIG|"), 5, "only the chunk that was still copying is repeated")
 
     def test_skipping_fk_drop_refuses_to_truncate(self):
         self.assertEqual(self.dataload("run", "--skip-constraints"), 1, self.output)
         self.assertIn("foreign key(s) still reference", self.output)
         self.assertEqual(self.loaded_tables(), [])
         self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints)
-        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(self.dataload("resume"), 1, "a plain resume keeps the flags of the run")
+        self.assertIn("continuing with the flags this run was started with: --skip-drop --skip-recreate", self.output)
+        self.assertEqual(self.loaded_tables(), [])
+        self.assertEqual(self.dataload("resume", "--no-skip"), 0, self.output)
         self.assert_everything_loaded()
 
     def test_skip_constraints_leaves_constraints_and_indexes_alone(self):
@@ -312,8 +414,13 @@ outbox = "outbox"
         self.assertEqual(self.dataload("run", "--skip-constraints"), 0, self.output)
         self.assert_everything_loaded()
         self.dataload("status")
-        self.assertRegex(self.output, r"drop/alpha/indexes\s+0/1\s+pending")
-        self.assertRegex(self.output, r"recreate/beta/FK\s+0/1\s+pending")
+        self.assertRegex(self.output, r"drop\s+0 / 12\s+skipped by flag")
+        self.assertRegex(self.output, r"recreate\s+0 / 12\s+skipped by flag")
+        self.assertIn("Flags     --skip-drop --skip-recreate", self.output)
+        self.assertNotIn("drop/alpha", self.output, "skipped steps are not listed")
+        self.assertEqual(self.subjects(), ["Phase finished: load", "Run finished: all done"])
+        outbox = sorted((self.tmp / "outbox").glob("*.txt"))[-1].read_text()
+        self.assertIn("drop      skipped by flag", outbox)
 
     def test_skip_drop_and_skip_recreate_work_on_their_own(self):
         sql("ALTER TABLE beta.b1 DROP CONSTRAINT b1_t1_fk")  # by hand, so the load may truncate
@@ -326,7 +433,7 @@ outbox = "outbox"
         self.assertIn("drop/beta/FK: done", self.output)
         self.assertNotIn("] recreate/", self.output)
         self.assertEqual(sql("SELECT count(*) FROM pg_constraint WHERE conname IN ('t1_pk', 'b1_t1_fk')"), "0")
-        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(self.dataload("resume", "--no-skip"), 0, self.output)
         self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints, "a later resume recreates them")
 
     def test_manual_drop_beforehand_is_harmless(self):
