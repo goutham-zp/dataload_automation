@@ -17,8 +17,11 @@ from .conf import OraConf
 from .notify import Notifier
 from .redact import redact
 
+# FATAL and ERROR count only as a message marker ("FATAL: ...", "ERROR:  ...", "[ERROR] ..."): ora2pg's
+# progress lines name the table being copied, and tables are called ERROR, WWW_ERRORS and the like.
 ERROR_RE = re.compile(
-    r"FATAL|ERROR|ORA-\d{5}|Aborting export|an error occurs during data export|install_driver\(\w+\) failed"
+    r"(?<![A-Za-z_])(?:FATAL|ERROR)(?=:|\])|ORA-\d{5}|Aborting export|an error occurs during data export"
+    r"|install_driver\(\w+\) failed"
 )
 ALREADY_RE = re.compile(r"already exists|multiple primary keys for table")
 # Drops that PostgreSQL refuses because there is nothing to do at that level: a partition's copy of

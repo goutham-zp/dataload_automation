@@ -78,6 +78,18 @@ class RealPlan(unittest.TestCase):
 
 
 class Parsing(unittest.TestCase):
+    def test_a_table_named_like_an_error_is_not_an_error(self):
+        bar = "[2026-10-10 16:18:45] [========================>] 0/0 rows (100.0%) Table "
+        self.assertEqual(first_error(bar + "MIGRATION_OFFER_ERRORS (1 sec., 0 recs/sec)"), "")
+        self.assertEqual(first_error(bar + "ERROR (1 sec., 0 recs/sec)"), "")
+        self.assertEqual(first_error("89/14394 total rows (0.6%), ERROR in progress."), "")
+        glued = "89/14394 total rows (0.6%), PAGE_BASE in progress.FATAL: ERROR:  numeric field overflow"
+        self.assertEqual(first_error(glued), glued)
+        self.assertTrue(first_error("DBD::Pg::db do failed: ERROR:  relation does not exist"))
+        self.assertTrue(first_error("[ERROR] Failed: ID between 1 and 2. Review logs at: x.log"))
+        self.assertTrue(first_error("ORA-01555: snapshot too old"))
+        self.assertTrue(first_error("Aborting export..."))
+
     def test_derive_narrows_tables_and_leaves_original_alone(self):
         with tempfile.TemporaryDirectory() as d:
             src = Path(d) / "a.conf"
