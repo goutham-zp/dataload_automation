@@ -34,7 +34,7 @@ workers = 4                    # statements in parallel (foreign keys always run
 
 [validate]
 # How a loaded table is checked against Oracle:
-#   "direct"     = count(*) on both sides; a conf's WHERE filter and chunk ranges are applied, so counts are exact
+#   "direct"     = count(1) on both sides; a conf's WHERE filter and chunk ranges are applied, so counts are exact
 #   "test_count" = ora2pg -t TEST_COUNT (slow to start: it scans Oracle's PL/SQL first; whole tables only)
 #   "exit"       = no counting, trust ora2pg's output only
 method = "direct"

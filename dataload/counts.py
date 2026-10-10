@@ -54,7 +54,7 @@ class Spec:
         return f"{self.schema}.{self.table}"
 
     def oracle_count_sql(self):
-        return f'SELECT COUNT(*) FROM "{self.schema}"."{self.table}"' + (f" WHERE {self.filter}" if self.filter else "")
+        return f'SELECT COUNT(1) FROM "{self.schema}"."{self.table}"' + (f" WHERE {self.filter}" if self.filter else "")
 
     def oracle_size_sql(self):
         # The table's own segments (every partition) plus its LOB segments; indexes are not included.
@@ -63,7 +63,7 @@ class Spec:
                 f"(SELECT segment_name FROM dba_lobs WHERE owner = '{self.schema}' AND table_name = '{self.table}'))")
 
     def pg_count_sql(self):
-        return f"SELECT count(*) FROM {self.pg}" + (f" WHERE {self.filter}" if self.filter and self.chunked else "")
+        return f"SELECT count(1) FROM {self.pg}" + (f" WHERE {self.filter}" if self.filter and self.chunked else "")
 
     def pg_size_sql(self):
         # A partitioned table has no storage of its own, so its partitions are added up;

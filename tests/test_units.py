@@ -137,8 +137,8 @@ class Counting(unittest.TestCase):
             engine = Engine(cfg, None, Flags())
             spec = engine.specs_for(steps["FTS/ora2pg_a_return_data.conf"])[0]
             self.assertEqual(spec.oracle_count_sql(),
-                             'SELECT COUNT(*) FROM "FTS"."A_RETURN_DATA" WHERE FTS_RETURN_ID NOT IN (4262, 2462)')
-            self.assertEqual(spec.pg_count_sql(), 'SELECT count(*) FROM "fts"."a_return_data"')
+                             'SELECT COUNT(1) FROM "FTS"."A_RETURN_DATA" WHERE FTS_RETURN_ID NOT IN (4262, 2462)')
+            self.assertEqual(spec.pg_count_sql(), 'SELECT count(1) FROM "fts"."a_return_data"')
             chunked = engine.specs_for(steps["FTS/SAC_DATA/run_SAC_DATA.sh"])[0]
             self.assertEqual(chunked.filter.count(" OR "), 9)
             self.assertIn(" WHERE (FTS_SAC_ID BETWEEN", chunked.pg_count_sql())

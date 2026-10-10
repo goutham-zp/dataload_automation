@@ -212,7 +212,7 @@ def build(state, cfg, target, source):
 <th class=n>Oracle</th><th class=n>PostgreSQL</th><th class=n>Difference</th><th class=n>Oracle</th>
 <th class=n>PostgreSQL before</th><th class=n>PostgreSQL after load</th><th class=n>PostgreSQL with indexes</th><th>Result</th><th>Checked</th></tr></thead>
 <tbody>{"".join(body)}</tbody></table></div>
-<footer><p>Rows are exact <code>count(*)</code> results taken on both databases. For a filtered table, Oracle is
+<footer><p>Rows are exact <code>count(1)</code> results taken on both databases. For a filtered table, Oracle is
 counted with the same filter the load used. For a chunked table, both sides are counted inside the loaded ranges only
 (hover the &#9432; mark to see the filter). Oracle size is the table and its LOB segments without indexes.
 "PostgreSQL after load" is measured as soon as the table's rows are in, before its indexes are rebuilt, so it compares

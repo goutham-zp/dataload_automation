@@ -22,7 +22,7 @@ for line in sys.stdin:
     if "dba_segments" in query:
         print(f"{ident}\tERROR ORA-00942: table or view does not exist")
         continue
-    m = re.match(r'SELECT COUNT\(\*\) FROM "(\w+)"\."(\w+)"(?: WHERE (.*))?$', query)
+    m = re.match(r'SELECT COUNT\(1\) FROM "(\w+)"\."(\w+)"(?: WHERE (.*))?$', query)
     rows = source.get(f"{m.group(1)}.{m.group(2)}", 0)
     if m.group(2) == os.environ.get("FAKE_COUNT_FAIL"):
         print(f"{ident}\tERROR ORA-00942: table or view does not exist")
