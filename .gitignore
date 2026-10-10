@@ -1,0 +1,21 @@
+# Secrets
+.env
+
+# Server content: the ora2pg confs in it hold database passwords in plain text.
+# Remove this line only if the repository is allowed to hold them.
+server_content/
+
+# Written by a run
+state/
+logs/
+work/
+outbox/
+report.html
+
+# Python
+__pycache__/
+*.pyc
+
+# Local-only helpers
+_g_scripts/
+.DS_Store

@@ -1,0 +1,31 @@
+#!/usr/bin/env python3
+"""Stand-in for the Oracle count helper, used only by the tests.
+
+Reads "id<TAB>sql" lines and answers from the same JSON file the fake ora2pg treats as Oracle,
+where rows are ids 1..n. FAKE_COUNT_FAIL names a table whose count must fail.
+"""
+import json
+import os
+import re
+import sys
+from pathlib import Path
+
+source = json.loads(Path(os.environ["FAKE_ORA_SOURCE"]).read_text() or "{}")
+for line in sys.stdin:
+    ident, _, query = line.rstrip("\n").partition("\t")
+    if "FROM dual" in query:
+        print(f"{ident}\t1")
+        continue
+    if "dba_segments" in query:
+        print(f"{ident}\tERROR ORA-00942: table or view does not exist")
+        continue
+    m = re.match(r'SELECT COUNT\(\*\) FROM "(\w+)"\."(\w+)"(?: WHERE (.*))?$', query)
+    rows = source.get(f"{m.group(1)}.{m.group(2)}", 0)
+    if m.group(2) == os.environ.get("FAKE_COUNT_FAIL"):
+        print(f"{ident}\tERROR ORA-00942: table or view does not exist")
+        continue
+    if m.group(3):
+        test = re.sub(r"ID BETWEEN (\d+) AND (\d+)", r"(\1 <= ID <= \2)", m.group(3))
+        test = re.sub(r"ID NOT IN \(([\d, ]+)\)", r"(ID not in (\1,))", test).replace(" OR ", " or ")
+        rows = sum(1 for ID in range(1, rows + 1) if eval(test))
+    print(f"{ident}\t{rows}", flush=True)

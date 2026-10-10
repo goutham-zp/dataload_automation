@@ -1,0 +1,55 @@
+# Settings for the data load. Secrets go in .env beside this file, not here.
+
+[paths]
+content = "server_content"
+state = "state/run.sqlite"     # keep on a local disk, not a network share
+logs = "logs"
+work = "work"                  # temporary conf copies and remaining-chunk files
+
+[tools]
+ora2pg = "ora2pg"
+psql = "psql"
+
+[target]
+# Safety check: must equal host:port/dbname from PG_DSN in the confs, or nothing runs.
+# The confs currently say "lstpsql01.fintech.net:5900/ftxe01".
+expected = ""
+
+[order]
+# Schema folders run in schema_list.txt order. List folder names here to leave them out.
+exclude = []
+
+[retry]
+attempts = 3                   # per invocation, for errors that look transient
+backoff_seconds = 30           # wait = backoff_seconds x attempt number
+# transient_patterns = ["ORA-08177", ...]   # regexes; defaults are in dataload/config.py
+
+[recreate]
+workers = 4                    # statements in parallel (foreign keys always run one at a time)
+
+[validate]
+# How a loaded table is checked against Oracle:
+#   "direct"     = count(*) on both sides; a conf's WHERE filter and chunk ranges are applied, so counts are exact
+#   "test_count" = ora2pg -t TEST_COUNT (slow to start: it scans Oracle's PL/SQL first; whole tables only)
+#   "exit"       = no counting, trust ora2pg's output only
+method = "direct"
+before_counts = true           # record every table's row count and size on both sides before anything is changed
+workers = 4                    # tables counted at the same time
+# Tables whose counts may differ without failing the load. With "direct" this is normally empty;
+# with "test_count" list the tables loaded with a WHERE filter, e.g. ["FTS.A_RETURN_DATA"].
+ignore = []
+
+[preflight]
+perl_dbd_pg = true
+
+[output]
+heartbeat_seconds = 60         # a "still running" line this often while a step works; 0 = off
+
+[email]
+enabled = false                # set true once .env has the Brevo login and key
+host = "smtp-relay.brevo.com"
+port = 587
+from = ""                      # a sender verified in Brevo
+to = []                        # e.g. ["you@example.com"]
+subject_prefix = "[dataload]"
+# outbox = "outbox"            # also write every mail to this folder as a text file

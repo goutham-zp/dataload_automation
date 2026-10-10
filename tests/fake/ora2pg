@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""Stand-in for ora2pg used only by the tests.
+
+"Oracle" is a JSON file (FAKE_ORA_SOURCE) of {"SCHEMA.TABLE": row_count}; rows are ids 1..n.
+Faults come from a JSON list (FAKE_ORA_FAULTS) of {"match", "mode", "times"} where match is a
+table name or part of a --where condition, and mode is transient | fatal | exit0 | hang.
+"""
+import fcntl
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+from dataload.conf import OraConf  # noqa: E402
+
+
+def psql(conf, sql):
+    r = subprocess.run(
+        [os.environ.get("FAKE_PSQL", "psql"), "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-c", sql],
+        env={**os.environ, **conf.pg_env()}, capture_output=True, text=True,
+    )
+    if r.returncode:
+        print(f"FATAL: {r.stderr.strip()}")
+        print("Aborting export...")
+        sys.exit(1)
+    return r.stdout.strip()
+
+
+def take_fault(table, where):
+    path = os.environ.get("FAKE_ORA_FAULTS")
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, "r+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        faults = json.load(f)
+        for fault in faults:
+            hit = fault["match"] == table or (where and fault["match"] in where)
+            if hit and fault.get("times", 1) > 0:
+                fault["times"] = fault.get("times", 1) - 1
+                f.seek(0)
+                f.truncate()
+                json.dump(faults, f)
+                return fault["mode"]
+    return None
+
+
+def main():
+    opts = {"-c": None, "-t": None, "-a": None, "--where": None}
+    argv = sys.argv[1:]
+    for i, arg in enumerate(argv):
+        if arg in opts:
+            opts[arg] = argv[i + 1]
+    conf = OraConf(opts["-c"])
+    schema, pg_schema = conf.get("SCHEMA").upper(), conf.pg_schema()
+    action = opts["-t"] or conf.get("TYPE")
+    if action == "SHOW_VERSION":
+        print("Oracle Database 19c (fake)")
+        return 0
+    source = json.loads(Path(os.environ["FAKE_ORA_SOURCE"]).read_text() or "{}")
+    tables = [opts["-a"]] if opts["-a"] else conf.tables()
+
+    if action == "TEST_COUNT":
+        print("[TEST ROWS COUNT]")
+        for t in tables:
+            print(f"ORACLEDB:{t}:{source.get(f'{schema}.{t}', 0)}")
+            print(f"POSTGRES:{t.lower()}:" + psql(conf, f'SELECT count(*) FROM "{pg_schema}"."{t.lower()}"'))
+        return 0
+
+    for t in tables:
+        where = opts["--where"]
+        with open(os.environ["FAKE_ORA_CALLS"], "a") as f:
+            f.write(f"{t}|{where or ''}\n")
+        mode = take_fault(t, where)
+        target = f'"{pg_schema}"."{t.lower()}"'
+        if conf.get("TRUNCATE_TABLE") == "1":
+            psql(conf, f"TRUNCATE {target} CASCADE")
+        rows = source.get(f"{schema}.{t}", 0)
+        partial = " AND id % 2 = 0" if mode else ""
+        if rows:
+            psql(conf, f"INSERT INTO {target} (id) SELECT id FROM generate_series(1, {rows}) "
+                       f"AS g(id) WHERE ({where or 'TRUE'}){partial}")
+        print(f"[========================>] rows (100.0%) Table {t}")
+        if mode == "transient":
+            print("ERROR: ORA-08177: can't serialize access for this transaction")
+            print("Aborting export...")
+            return 1
+        if mode == "fatal":
+            print('FATAL: ERROR:  duplicate key value violates unique constraint "x_pkey"')
+            print("Aborting export...")
+            return 1
+        if mode == "exit0":
+            print("WARNING: an error occurs during data export. Please check what's happen.")
+        if mode == "hang":
+            sys.stdout.flush()
+            time.sleep(600)
+    return 0
+
+
+sys.exit(main())

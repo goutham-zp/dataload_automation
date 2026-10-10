@@ -1,0 +1,356 @@
+"""End-to-end tests against a local PostgreSQL 18, with tests/fake/ora2pg standing in for Oracle.
+
+They build their own small content folder; server_content is only used as the source of one
+patched run_*.sh, which is copied and run against the local database.
+
+    DATALOAD_TEST_PGPORT (default 54318), DATALOAD_TEST_PGBIN (default Homebrew postgresql@18)
+"""
+import getpass
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+PGBIN = Path(os.environ.get("DATALOAD_TEST_PGBIN", "/opt/homebrew/opt/postgresql@18/bin"))
+PGPORT = os.environ.get("DATALOAD_TEST_PGPORT", "54318")
+PSQL = str(PGBIN / "psql")
+DB = "dataload_test"
+USER = getpass.getuser()
+REAL_SCRIPT = ROOT / "server_content" / "FTS" / "SAC_DATA" / "run_SAC_DATA.sh"
+
+DDL = """
+DROP SCHEMA IF EXISTS alpha CASCADE; DROP SCHEMA IF EXISTS beta CASCADE;
+CREATE SCHEMA alpha; CREATE SCHEMA beta;
+CREATE TABLE alpha.t1 (id int CONSTRAINT t1_id_not_null NOT NULL, CONSTRAINT t1_pk PRIMARY KEY (id));
+CREATE TABLE alpha.t2 (id int CONSTRAINT t2_id_not_null NOT NULL, CONSTRAINT t2_pk PRIMARY KEY (id));
+CREATE TABLE alpha.t3 (id int CONSTRAINT t3_id_not_null NOT NULL, CONSTRAINT t3_pk PRIMARY KEY (id));
+CREATE TABLE alpha.big (id int CONSTRAINT big_id_not_null NOT NULL, CONSTRAINT big_pk PRIMARY KEY (id));
+CREATE INDEX t2_idx ON alpha.t2 USING btree (id);
+CREATE TABLE beta.b1 (id int CONSTRAINT b1_id_not_null NOT NULL, t1_id int DEFAULT 1,
+    CONSTRAINT b1_pk PRIMARY KEY (id), CONSTRAINT b1_t1_fk FOREIGN KEY (t1_id) REFERENCES alpha.t1(id));
+"""
+GENERATED = {
+    "alpha": {
+        "PK_drop_script.sql": [f"ALTER TABLE alpha.{t} DROP CONSTRAINT IF EXISTS {t}_pk;" for t in ("big", "t3", "t2", "t1")],
+        "PK_recreate_script.sql": [f"ALTER TABLE alpha.{t} ADD CONSTRAINT {t}_pk PRIMARY KEY (id);" for t in ("t1", "t2", "t3", "big")],
+        "Other_drop_script.sql": [f"ALTER TABLE alpha.{t} DROP CONSTRAINT IF EXISTS {t}_id_not_null;" for t in ("big", "t3", "t2", "t1")],
+        "Other_recreate_script.sql": [f"ALTER TABLE alpha.{t} ADD CONSTRAINT {t}_id_not_null NOT NULL id;" for t in ("t1", "t2", "t3", "big")],
+        "all_indexes_drop.sql": ["DROP INDEX IF EXISTS alpha.t2_idx;"],
+        "all_indexes_create.sql": ["CREATE INDEX t2_idx ON alpha.t2 USING btree (id);"],
+    },
+    "beta": {
+        "FK_drop_script.sql": ["ALTER TABLE beta.b1 DROP CONSTRAINT IF EXISTS b1_t1_fk;"],
+        "FK_recreate_script.sql": ["ALTER TABLE beta.b1 ADD CONSTRAINT b1_t1_fk FOREIGN KEY (t1_id) REFERENCES alpha.t1(id);"],
+        "PK_drop_script.sql": ["ALTER TABLE beta.b1 DROP CONSTRAINT IF EXISTS b1_pk;"],
+        "PK_recreate_script.sql": ["ALTER TABLE beta.b1 ADD CONSTRAINT b1_pk PRIMARY KEY (id);"],
+        "Other_drop_script.sql": ["ALTER TABLE beta.b1 DROP CONSTRAINT IF EXISTS b1_id_not_null;"],
+        "Other_recreate_script.sql": ["ALTER TABLE beta.b1 ADD CONSTRAINT b1_id_not_null NOT NULL id;"],
+    },
+}
+SOURCE = {"ALPHA.T1": 10, "ALPHA.T2": 20, "ALPHA.T3": 5, "ALPHA.BIG": 100, "BETA.B1": 8}
+CHUNKS = ["ID BETWEEN 1 AND 25", "ID BETWEEN 26 AND 50", "ID BETWEEN 51 AND 75", "ID BETWEEN 76 AND 9999"]
+CONSTRAINTS_SQL = ("SELECT count(*) FROM pg_constraint c JOIN pg_namespace n ON n.oid = c.connamespace "
+                   "WHERE n.nspname IN ('alpha', 'beta')")
+
+
+def sql(statement):
+    r = subprocess.run([PSQL, "-X", "-q", "-A", "-t", "-v", "ON_ERROR_STOP=1", "-h", "localhost", "-p", PGPORT,
+                        "-d", DB, "-c", statement], capture_output=True, text=True)
+    if r.returncode:
+        raise RuntimeError(r.stderr)
+    return r.stdout.strip()
+
+
+def database_available():
+    try:
+        return sql("SHOW server_version_num") >= "180000"
+    except (RuntimeError, OSError):
+        return False
+
+
+def conf_text(schema, tables=None):
+    lines = ["ORACLE_DSN  dbi:Oracle:host=fake", f"SCHEMA  {schema}", "TYPE  COPY"]
+    if tables:
+        lines += ["TRUNCATE_TABLE  1", "PG_TRUNCATE_OPTION CASCADE",
+                  f"ALLOW  {' '.join(tables)}", "", f"TABLE  {' '.join(tables)}"]
+    lines += [f"PG_DSN  dbi:Pg:dbname={DB};host=localhost;port={PGPORT}", f"PG_USER  {USER}", "PG_PWD  unused",
+              f"PG_SCHEMA  {schema.lower()}"]
+    return "\n".join(lines) + "\n"
+
+
+@unittest.skipUnless(database_available(), f"no PostgreSQL 18 with database {DB} on localhost:{PGPORT}")
+@unittest.skipUnless(shutil.which("parallel"), "GNU parallel not installed")
+class EndToEnd(unittest.TestCase):
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="dataload_e2e_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        sql(DDL)
+        content = self.tmp / "content"
+        (content / "ALPHA" / "BIG").mkdir(parents=True)
+        (content / "BETA").mkdir()
+        (content / "schema_list.txt").write_text("alpha\nbeta\nalpha\nnot_here\n")
+        # Written out of order on purpose: set_2 must still run after set_1.
+        (content / "ALPHA" / "ora2pg_set_2.conf").write_text(conf_text("ALPHA", ["T3"]))
+        (content / "ALPHA" / "ora2pg_set_1.conf").write_text(conf_text("ALPHA", ["T1", "T2"]))
+        (content / "ALPHA" / "BIG" / "ora2pg_BIG.conf").write_text(conf_text("ALPHA"))
+        (content / "ALPHA" / "BIG" / "chunks.txt").write_text("\n".join(CHUNKS) + "\n")
+        script = REAL_SCRIPT.read_text()
+        script = script.replace("ora2pg_SAC_DATA.conf", "ora2pg_BIG.conf").replace('TABLE_NAME="SAC_DATA"', 'TABLE_NAME="BIG"')
+        script = re.sub(r"PARALLEL_JOBS=\d+", "PARALLEL_JOBS=2", script)
+        (content / "ALPHA" / "BIG" / "run_BIG.sh").write_text(script)
+        (content / "BETA" / "ora2pg_set_1.conf").write_text(conf_text("BETA", ["B1"]))
+        for schema, files in GENERATED.items():
+            folder = content / "generated_scripts_for_all_schema" / f"{schema}_generated_scripts"
+            folder.mkdir(parents=True)
+            for name, statements in files.items():
+                (folder / name).write_text("\n".join(statements) + "\n")
+        (self.tmp / "dataload.toml").write_text(f"""
+[paths]
+content = "content"
+[tools]
+psql = "{PSQL}"
+oracle_count = "{ROOT / 'tests' / 'fake' / 'oracle_count'}"
+[target]
+expected = "localhost:{PGPORT}/{DB}"
+[retry]
+attempts = 3
+backoff_seconds = 0
+[preflight]
+perl_dbd_pg = false
+[email]
+enabled = false
+outbox = "outbox"
+""")
+        self.faults = self.tmp / "faults.json"
+        self.calls = self.tmp / "calls.log"
+        self.set_faults([])
+        self.calls.write_text("")
+        (self.tmp / "source.json").write_text(json.dumps(SOURCE))
+        self.env = {**os.environ, "PATH": f"{ROOT / 'tests' / 'fake'}:{os.environ['PATH']}",
+                    "PYTHONPATH": str(ROOT), "FAKE_PSQL": PSQL, "FAKE_ORA_SOURCE": str(self.tmp / "source.json"),
+                    "FAKE_ORA_FAULTS": str(self.faults), "FAKE_ORA_CALLS": str(self.calls)}
+        self.all_constraints = int(sql(CONSTRAINTS_SQL))
+
+    # ----- helpers -----
+
+    def set_faults(self, faults):
+        self.faults.write_text(json.dumps(faults))
+
+    def argv(self, *args):
+        return [sys.executable, "-m", "dataload", "--config", str(self.tmp / "dataload.toml"), *args]
+
+    def dataload(self, *args):
+        r = subprocess.run(self.argv(*args), env=self.env, capture_output=True, text=True, cwd=self.tmp)
+        self.output = r.stdout + r.stderr
+        return r.returncode
+
+    def count(self, table):
+        return int(sql(f"SELECT count(*) FROM {table}"))
+
+    def loaded_tables(self):
+        return [line.split("|")[0] for line in self.calls.read_text().splitlines()]
+
+    def subjects(self):
+        files = sorted((self.tmp / "outbox").glob("*.txt")) if (self.tmp / "outbox").exists() else []
+        return [f.read_text().splitlines()[0].replace("Subject: [dataload] ", "") for f in files]
+
+    def assert_everything_loaded(self):
+        for name, rows in SOURCE.items():
+            self.assertEqual(self.count(name.lower()), rows, name)
+        self.assertEqual(self.count("(SELECT DISTINCT id FROM alpha.big) d"), 100)
+        self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints)
+        self.assertEqual(sql("SELECT count(*) FROM pg_indexes WHERE indexname = 't2_idx'"), "1")
+
+    # ----- tests -----
+
+    def test_clean_run_loads_everything_and_restores_constraints(self):
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        tables = self.loaded_tables()
+        self.assertEqual(tables[:3], ["T1", "T2", "T3"])
+        self.assertEqual(tables.count("BIG"), 4)
+        self.assertEqual(tables[-1], "B1")
+        self.assertEqual(self.subjects(), ["Phase finished: drop", "Phase finished: load",
+                                           "Phase finished: recreate", "Run finished: all done"])
+        for expected in ("load step 1 of 4: ALPHA/ora2pg_set_1.conf, 2 of 2 tables to do",
+                         "ALPHA/ora2pg_set_1.conf: copying 2 table(s) with ora2pg (T1, T2)",
+                         "ALPHA/ora2pg_set_1.conf: T1: oracle=10 postgres=10 equal",
+                         "ALPHA/BIG/run_BIG.sh: running 4 chunk(s) of BIG",
+                         "4 of 4 chunks finished"):
+            self.assertIn(expected, self.output)
+        self.assertEqual(self.dataload("status", "--counts"), 0, self.output)
+        self.assertIn("5 table(s), 5 compared after the load, 0 different", self.output)
+        self.assertRegex(self.output, r"ALPHA\.BIG \(filtered\)\s+100\s+0\s+100\s+100")
+        html = (self.tmp / "report.html").read_text()
+        self.assertIn("Completed, all tables match", html)
+        self.assertEqual(html.count('<span class="pill ok">Match</span>'), 5)
+        self.assertIn("4 chunks", html)
+        self.dataload("report")
+        import sqlite3
+        db = sqlite3.connect(self.tmp / "state" / "run.sqlite")
+        sizes = db.execute("SELECT tbl, pg_bytes_loaded, pg_bytes_after FROM snapshot").fetchall()
+        self.assertTrue(all(loaded and after for _, loaded, after in sizes), sizes)
+        t1 = [row for row in sizes if row[0] == "T1"][0]
+        self.assertLess(t1[1], t1[2], "the size after load is taken before the primary key index is rebuilt")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(self.loaded_tables(), tables, "a resume of a finished run must load nothing")
+
+    def test_before_counts_are_taken_first_and_kept_across_a_resume(self):
+        sql("INSERT INTO alpha.t3 SELECT generate_series(1, 3)")  # rows left by an earlier load
+        self.set_faults([{"match": "T2", "mode": "fatal", "times": 99}])
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.assertLess(self.output.index("before-load snapshot took"), self.output.index("drop/"))
+        self.assertIn("5 table(s), 143 rows to load from Oracle, 3 rows in PostgreSQL now", self.output)
+        html = (self.tmp / "report.html").read_text()
+        self.assertIn("Needs attention", html)
+        self.assertIn("<strong>ALPHA.T2</strong>: Failed", html)
+        self.set_faults([])
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertNotIn("before-load snapshot", self.output, "a resume must not recount what it already recorded")
+        self.dataload("status", "--counts")
+        self.assertRegex(self.output, r"ALPHA\.T3\s+5\s+3\s+5\s+5", "the before count is the one from before the load")
+        self.assertEqual(self.dataload("report"), 0, self.output)
+
+    def test_a_failed_before_count_stops_the_run_before_anything_changes(self):
+        self.env["FAKE_COUNT_FAIL"] = "T3"
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.assertIn("the before-load count failed for 1 table(s), so nothing was changed", self.output)
+        self.assertEqual(self.loaded_tables(), [])
+        self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints)
+        del self.env["FAKE_COUNT_FAIL"]
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_test_count_method_still_works(self):
+        toml = self.tmp / "dataload.toml"
+        toml.write_text(toml.read_text() + '\n[validate]\nmethod = "test_count"\n')
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assertIn("(ora2pg TEST_COUNT)", self.output)
+        self.assert_everything_loaded()
+        self.dataload("status", "--counts")
+        self.assertIn("5 compared after the load, 0 different", self.output)
+
+    def test_transient_chunk_failure_is_retried_without_duplicate_rows(self):
+        self.set_faults([{"match": "ID BETWEEN 26 AND 50", "mode": "transient", "times": 1}])
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        self.assertEqual(self.loaded_tables().count("BIG"), 5)
+        self.assertNotIn("Step failed: ALPHA/BIG/run_BIG.sh", self.subjects())
+
+    def test_transient_table_failure_reloads_only_that_table(self):
+        self.set_faults([{"match": "T2", "mode": "transient", "times": 1}])
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        self.assertEqual(self.loaded_tables()[:3], ["T1", "T2", "T2"])
+
+    def test_persistent_failure_blocks_recreate_and_resume_does_only_what_failed(self):
+        self.set_faults([{"match": "T2", "mode": "fatal", "times": 99},
+                         {"match": "ID BETWEEN 51 AND 75", "mode": "fatal", "times": 99}])
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.assertEqual(self.count("alpha.t3"), 5, "later steps still load after a failure")
+        self.assertEqual(self.count("beta.b1"), 8)
+        self.assertEqual(sql("SELECT count(*) FROM pg_constraint WHERE conname = 't1_pk'"), "0",
+                         "constraints must not be recreated on an incomplete load")
+        subjects = self.subjects()
+        self.assertIn("Step failed: ALPHA/ora2pg_set_1.conf", subjects)
+        self.assertIn("Step failed: ALPHA/BIG/run_BIG.sh", subjects)
+        self.assertEqual(subjects[-1], "Run finished: NEEDS ATTENTION")
+        self.assertEqual(self.dataload("status", "--failed"), 0)
+        self.assertIn("duplicate key", self.output)
+
+        self.set_faults([])
+        self.calls.write_text("")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(sorted(self.loaded_tables()), ["BIG", "T2"])
+        self.assertIn("|ID BETWEEN 51 AND 75", self.calls.read_text())
+        self.assert_everything_loaded()
+        self.assertIn("Run resumed", self.subjects())
+        self.assertEqual(self.subjects()[-1], "Run finished: all done")
+
+    def test_error_with_exit_code_zero_is_caught_by_row_count(self):
+        self.set_faults([{"match": "T3", "mode": "exit0", "times": 1}])
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.dataload("status", "--failed")
+        self.assertIn("row count mismatch: oracle=5 postgres=2", self.output)
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_killed_mid_chunk_resumes_cleanly(self):
+        self.set_faults([{"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])
+        proc = subprocess.Popen(self.argv("run"), env=self.env, cwd=self.tmp, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 60
+        while "ID BETWEEN 51 AND 75" not in self.calls.read_text() and time.time() < deadline:
+            time.sleep(0.2)
+        time.sleep(1.5)  # let the hanging chunk write its partial rows
+        proc.send_signal(signal.SIGTERM)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, out)
+        self.assertGreater(self.count("alpha.big"), 0)
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_skipping_fk_drop_refuses_to_truncate(self):
+        self.assertEqual(self.dataload("run", "--skip-constraints"), 1, self.output)
+        self.assertIn("foreign key(s) still reference", self.output)
+        self.assertEqual(self.loaded_tables(), [])
+        self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints)
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_skip_constraints_leaves_constraints_and_indexes_alone(self):
+        sql("ALTER TABLE beta.b1 DROP CONSTRAINT b1_t1_fk")  # dropped by hand, as the flag assumes
+        self.all_constraints -= 1
+        self.assertEqual(self.dataload("run", "--skip-constraints"), 0, self.output)
+        self.assert_everything_loaded()
+        self.dataload("status")
+        self.assertRegex(self.output, r"drop/alpha/indexes\s+0/1\s+pending")
+        self.assertRegex(self.output, r"recreate/beta/FK\s+0/1\s+pending")
+
+    def test_skip_drop_and_skip_recreate_work_on_their_own(self):
+        sql("ALTER TABLE beta.b1 DROP CONSTRAINT b1_t1_fk")  # by hand, so the load may truncate
+        self.assertEqual(self.dataload("run", "--skip-drop"), 0, self.output)
+        self.assertNotIn("] drop/", self.output)
+        self.assertIn("recreate/beta/FK: done", self.output, "recreate still runs and restores the FK")
+        self.assert_everything_loaded()
+        sql("TRUNCATE alpha.big")  # chunked tables are not truncated by the load, so a second run needs this
+        self.assertEqual(self.dataload("run", "--new", "--skip-recreate"), 0, self.output)
+        self.assertIn("drop/beta/FK: done", self.output)
+        self.assertNotIn("] recreate/", self.output)
+        self.assertEqual(sql("SELECT count(*) FROM pg_constraint WHERE conname IN ('t1_pk', 'b1_t1_fk')"), "0")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints, "a later resume recreates them")
+
+    def test_manual_drop_beforehand_is_harmless(self):
+        sql("ALTER TABLE beta.b1 DROP CONSTRAINT b1_t1_fk; DROP INDEX alpha.t2_idx;")
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+
+    def test_second_run_is_refused_and_wrong_target_stops_preflight(self):
+        toml = self.tmp / "dataload.toml"
+        good = toml.read_text()
+        toml.write_text(good.replace(f'expected = "localhost:{PGPORT}/{DB}"', 'expected = ""'))
+        self.assertEqual(self.dataload("run"), 2)
+        self.assertIn("expected is not set", self.output)
+        self.assertEqual(self.dataload("resume"), 2)
+        self.assertIn("nothing to resume", self.output)
+        toml.write_text(good)
+        self.assertEqual(self.dataload("run"), 0, "a run that stopped at preflight must not block the next run")
+        self.assertEqual(self.dataload("run"), 2)
+        self.assertIn("Use 'resume'", self.output)
+        toml = self.tmp / "dataload.toml"
+        toml.write_text(toml.read_text().replace(f"localhost:{PGPORT}/{DB}", "prod.example.net:5900/x"))
+        self.assertEqual(self.dataload("run", "--new"), 2)
+        self.assertIn("expects prod.example.net:5900/x", self.output)
+
+
+if __name__ == "__main__":
+    unittest.main()
