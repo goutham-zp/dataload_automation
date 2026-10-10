@@ -54,10 +54,12 @@ heartbeat_seconds = 60         # a "still running" line this often while a step 
 hide_values = true
 
 [email]
-enabled = false                # set true once .env has the Brevo login and key
-host = "smtp-relay.brevo.com"
+enabled = false                # set true once .env has SMTP_LOGIN and SMTP_PASSWORD
+# SendGrid: host "smtp.sendgrid.net", SMTP_LOGIN is the literal word apikey, SMTP_PASSWORD is the API key.
+# Brevo:    host "smtp-relay.brevo.com", SMTP_LOGIN is the SMTP login, SMTP_PASSWORD is the SMTP key.
+host = "smtp.sendgrid.net"
 port = 587
-from = ""                      # a sender verified in Brevo
+from = ""                      # a sender verified with the mail provider
 to = []                        # e.g. ["you@example.com"]
 subject_prefix = "[dataload]"
 # outbox = "outbox"            # also write every mail to this folder as a text file

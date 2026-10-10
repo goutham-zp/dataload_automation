@@ -1,4 +1,4 @@
-"""Email through an SMTP relay (Brevo). A mail failure is logged and never stops the load."""
+"""Email through an SMTP relay (SendGrid, Brevo, ...). A mail failure is logged and never stops the load."""
 import os
 import smtplib
 import time
@@ -33,7 +33,9 @@ class Notifier:
                                    filename=Path(attach).name)
             with smtplib.SMTP(s.get("host", "smtp-relay.brevo.com"), int(s.get("port", 587)), timeout=30) as smtp:
                 smtp.starttls()
-                smtp.login(os.environ["BREVO_SMTP_LOGIN"], os.environ["BREVO_SMTP_KEY"])
+                # The BREVO_ names are the ones this tool started with; a .env that still uses them works.
+                smtp.login(os.environ.get("SMTP_LOGIN") or os.environ["BREVO_SMTP_LOGIN"],
+                           os.environ.get("SMTP_PASSWORD") or os.environ["BREVO_SMTP_KEY"])
                 smtp.send_message(msg)
         except Exception as e:  # noqa: BLE001 - any mail problem must not stop the load
             self.log(f"email not sent ({subject}): {e!r}")
