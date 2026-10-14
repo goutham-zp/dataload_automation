@@ -186,6 +186,134 @@ class Redaction(unittest.TestCase):
         self.assertIsNone(redact(None))
 
 
+def small_content(root):
+    """ALPHA: set_1 (T1, T2), set_2 (T3), BIG chunk script. BETA: set_1 (B1)."""
+    def conf(path, schema, tables):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(f"SCHEMA  {schema}\nTYPE  COPY\nALLOW  {' '.join(tables)}\nPG_SCHEMA  {schema.lower()}\n")
+
+    conf(root / "ALPHA" / "ora2pg_set_1.conf", "ALPHA", ["T1", "T2"])
+    conf(root / "ALPHA" / "ora2pg_set_2.conf", "ALPHA", ["T3"])
+    conf(root / "ALPHA" / "BIG" / "ora2pg_BIG.conf", "ALPHA", [])
+    (root / "ALPHA" / "BIG" / "chunks.txt").write_text("ID < 50\nID >= 50\n")
+    (root / "ALPHA" / "BIG" / "run_BIG.sh").write_text(
+        'CONFIG_FILE="ora2pg_BIG.conf"\nTABLE_NAME="BIG"\nCHUNKS_FILE="${CHUNKS_FILE:-./chunks.txt}"\n')
+    conf(root / "BETA" / "ora2pg_set_1.conf", "BETA", ["B1"])
+    (root / "schema_list.txt").write_text("alpha\nbeta\n")
+
+
+class Lanes(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        small_content(self.root)
+
+    def layout(self, enabled=True, only=(), **lanes):
+        cfg = Config(root=self.root, content=self.root, state=self.root / "s", logs=self.root / "l",
+                     work=self.root / "w", lanes_enabled=enabled, lanes=lanes, only=list(only))
+        return plan.lanes(cfg, plan.load_steps(cfg))
+
+    def names(self, lanes):
+        return [(name, [s.id for s in steps]) for name, steps in lanes]
+
+    def test_off_means_no_lanes_and_no_checks(self):
+        self.assertEqual(self.layout(enabled=False, lane1=["NOT/a_step.conf"]), ([], [], []))
+
+    def test_steps_run_in_the_order_listed_and_star_takes_the_rest_in_plan_order(self):
+        lanes, problems, warnings = self.layout(big=["ALPHA/BIG/run_BIG.sh"],
+                                                small=["BETA/ora2pg_set_1.conf", "*"])
+        self.assertEqual((problems, warnings), ([], []))
+        self.assertEqual(self.names(lanes), [
+            ("big", ["ALPHA/BIG/run_BIG.sh"]),
+            ("small", ["BETA/ora2pg_set_1.conf", "ALPHA/ora2pg_set_1.conf", "ALPHA/ora2pg_set_2.conf"])])
+
+    def test_every_step_listed_by_name_needs_no_star(self):
+        lanes, problems, _ = self.layout(a=["ALPHA/ora2pg_set_2.conf", "ALPHA/ora2pg_set_1.conf"],
+                                         b=["ALPHA/BIG/run_BIG.sh", "BETA/ora2pg_set_1.conf"])
+        self.assertEqual(problems, [])
+        self.assertEqual(self.names(lanes)[0], ("a", ["ALPHA/ora2pg_set_2.conf", "ALPHA/ora2pg_set_1.conf"]))
+
+    def test_unknown_step_name_is_refused(self):
+        lanes, problems, _ = self.layout(a=["ALPHA/ora2pg_set_9.conf", "*"])
+        self.assertEqual(lanes, [])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("lane a: no load step is called 'ALPHA/ora2pg_set_9.conf'", problems[0])
+
+    def test_step_in_two_lanes_is_refused(self):
+        _, problems, _ = self.layout(a=["ALPHA/ora2pg_set_1.conf"], b=["ALPHA/ora2pg_set_1.conf", "*"])
+        self.assertEqual(problems, ["ALPHA/ora2pg_set_1.conf is in lane a and lane b; a step can be in one lane only"])
+
+    def test_star_in_two_lanes_is_refused(self):
+        _, problems, _ = self.layout(a=["*"], b=["*"])
+        self.assertEqual(problems, ['"*" is in lane a and lane b; only one lane can take the rest'])
+
+    def test_a_step_in_no_lane_is_refused(self):
+        _, problems, _ = self.layout(a=["ALPHA/BIG/run_BIG.sh"], b=["ALPHA/ora2pg_set_1.conf"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("2 load step(s) are in no lane", problems[0])
+        self.assertIn("ALPHA/ora2pg_set_2.conf, BETA/ora2pg_set_1.conf", problems[0])
+
+    def test_lane_that_is_not_a_list_of_names_is_refused(self):
+        _, problems, _ = self.layout(a="ALPHA/ora2pg_set_1.conf", b=["*"])
+        self.assertEqual(problems, ["lane a: must be a list of load step names, as 'plan' shows them, "
+                                    'e.g. a = ["FTS/ora2pg_set_5.conf"]'])
+        _, problems, _ = self.layout(a=[], b=["*"])
+        self.assertIn("lane a: must be a list", problems[0])
+
+    def test_enabled_with_no_lane_is_refused(self):
+        _, problems, _ = self.layout()
+        self.assertEqual(problems, ["[lanes] enabled = true, but no lane is listed"])
+
+    def test_same_table_in_two_lanes_is_refused_and_in_one_lane_allowed(self):
+        conf = self.root / "ALPHA" / "ora2pg_set_2.conf"
+        conf.write_text(conf.read_text().replace("ALLOW  T3", "ALLOW  T3 T1"))
+        _, problems, _ = self.layout(a=["ALPHA/ora2pg_set_1.conf"], b=["ALPHA/ora2pg_set_2.conf", "*"])
+        self.assertEqual(len(problems), 1)
+        self.assertIn("alpha.t1 is loaded by ALPHA/ora2pg_set_1.conf in lane a and by ALPHA/ora2pg_set_2.conf "
+                      "in lane b", problems[0])
+        _, problems, _ = self.layout(a=["ALPHA/ora2pg_set_1.conf", "ALPHA/ora2pg_set_2.conf"], b=["*"])
+        self.assertEqual(problems, [], "one after the other in one lane is how it runs today")
+
+    def test_chunked_table_also_in_a_conf_of_another_lane_is_refused(self):
+        (self.root / "BETA" / "ora2pg_set_1.conf").write_text("SCHEMA  ALPHA\nTYPE  COPY\nALLOW  BIG\nPG_SCHEMA  alpha\n")
+        _, problems, _ = self.layout(a=["ALPHA/BIG/run_BIG.sh"], b=["*"])
+        self.assertIn("alpha.big is loaded by ALPHA/BIG/run_BIG.sh in lane a and by BETA/ora2pg_set_1.conf in lane b",
+                      problems[0])
+
+    def test_chunk_scripts_in_two_lanes_is_only_a_warning(self):
+        second = self.root / "BETA" / "BIG2"
+        second.mkdir()
+        (second / "ora2pg_BIG2.conf").write_text("SCHEMA  BETA\nTYPE  COPY\nPG_SCHEMA  beta\n")
+        (second / "chunks.txt").write_text("ID < 50\n")
+        (second / "run_BIG2.sh").write_text(
+            'CONFIG_FILE="ora2pg_BIG2.conf"\nTABLE_NAME="BIG2"\nCHUNKS_FILE="${CHUNKS_FILE:-./chunks.txt}"\n')
+        lanes, problems, warnings = self.layout(a=["ALPHA/BIG/run_BIG.sh"], b=["BETA/BIG2/run_BIG2.sh"], c=["*"])
+        self.assertEqual(problems, [])
+        self.assertEqual(len(lanes), 3)
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("chunk scripts are in 2 lanes (a, b)", warnings[0])
+
+    def test_only_leaves_out_steps_of_other_folders_without_complaint(self):
+        lanes, problems, _ = self.layout(only=["BETA"], a=["ALPHA/BIG/run_BIG.sh"], b=["*"])
+        self.assertEqual(problems, [])
+        self.assertEqual(self.names(lanes), [("b", ["BETA/ora2pg_set_1.conf"])], "a lane left with nothing is dropped")
+
+
+@unittest.skipUnless(CONTENT.is_dir(), "server_content not present")
+class AgreedLanes(unittest.TestCase):
+    def test_the_layout_in_dataload_toml_fits_the_confs(self):
+        from dataload import config
+        cfg = config.load(ROOT / "dataload.toml")
+        cfg.content, cfg.lanes_enabled = CONTENT, True
+        lanes, problems, warnings = plan.lanes(cfg, plan.load_steps(cfg))
+        self.assertEqual((problems, warnings), ([], []))
+        self.assertEqual([name for name, _ in lanes], ["lane1", "lane2", "lane3", "lane4"])
+        self.assertEqual([s.id for s in lanes[0][1]], ["FTS/ora2pg_set_5.conf"])
+        self.assertTrue(all(s.kind == "chunk" for s in lanes[2][1]))
+        self.assertEqual(sum(len(steps) for _, steps in lanes), len(plan.load_steps(cfg)))
+
+
 class FriendlyStartErrors(unittest.TestCase):
     def run_cli(self, *argv):
         from dataload.cli import main

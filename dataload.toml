@@ -44,6 +44,25 @@ workers = 4                    # tables counted at the same time
 # with "test_count" list the tables loaded with a WHERE filter, e.g. ["FTS.A_RETURN_DATA"].
 ignore = []
 
+[lanes]
+# Off: the load steps run one at a time, as before.
+# On: each lane below runs its steps one at a time, in the order listed, and the lanes run side by side.
+# Names are the load steps as 'plan' shows them. "*" stands for every load step no other lane names.
+# 'plan' and 'preflight' refuse a layout with an unknown name, a step in two lanes, a step in no lane,
+# or one table loaded in two lanes. Drop, recreate and validation are not affected and run as before.
+enabled = false
+lane1 = ["FTS/ora2pg_set_5.conf"]
+lane2 = ["FTS/ora2pg_set_3.conf", "FTS/ora2pg_set_4.conf", "FTS/ora2pg_set_6.conf"]
+lane3 = [
+    "FTS/A_EDI_DATA/run_A_EDI_DATA_1.sh",
+    "FAST/EMAIL_TO_SEND_ARCHIVE_1/run_EMAIL_TO_SEND_ARCHIVE.sh",
+    "FTS/A_EDI_SUMMASY/run_A_EDI_SUMMARY.sh",
+    "FTS/SAC_DATA/run_SAC_DATA.sh",
+    "FTS/A_EFT_PROCESSED/run_A_EFT_PROCESSED.sh",
+]
+lane4 = ["FTS/ora2pg_set_7.conf", "FAST/ora2pg_set_1.conf", "FTS/ora2pg_set_8.conf",
+         "FAST_TRACK/ora2pg_fast_track_set.conf", "SECADMIN/ora2pg_set_1.conf", "*"]
+
 [preflight]
 perl_dbd_pg = true
 

@@ -1,6 +1,6 @@
 """Turn the server_content folder into an ordered list of steps."""
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from .conf import OraConf
@@ -107,6 +107,83 @@ def load_steps(cfg):
             continue
         _walk(folders[name], content, name.lower(), steps)
     return steps
+
+
+REST = "*"
+
+
+def lane_label(name):
+    return name if name.lower().startswith("lane") else f"lane {name}"
+
+
+def loaded_tables(step):
+    """The schema.table names a load step writes to, lower case."""
+    conf = step.conf_path
+    schema = (OraConf(conf).pg_schema() if conf and conf.exists() else "") or step.schema
+    return [f"{schema}.{t.lower()}" for t in ([step.table] if step.kind == "chunk" else step.units)]
+
+
+def lanes(cfg, loads):
+    """The load steps grouped by [lanes] in dataload.toml, as ([(name, [Step, ...])], problems, warnings).
+    A lane runs its steps in the order listed and the lanes run side by side; "*" stands for every load
+    step no lane names. Nothing is returned, and nothing is checked, while lanes are off."""
+    if not cfg.lanes_enabled:
+        return [], [], []
+    problems, warnings = [], []
+    # Names are checked against every step, so a lane naming a folder that --only leaves out is not a typo.
+    known = {s.id for s in load_steps(replace(cfg, only=[], exclude=[]))}
+    placed, rest_lane, layout = {}, None, []
+    for name, entries in cfg.lanes.items():
+        if not isinstance(entries, list) or not entries or not all(isinstance(e, str) for e in entries):
+            problems.append(f"{lane_label(name)}: must be a list of load step names, as 'plan' shows them, "
+                            'e.g. a = ["FTS/ora2pg_set_5.conf"]')
+            continue
+        for entry in entries:
+            if entry == REST:
+                if rest_lane:
+                    problems.append(f'"*" is in {lane_label(rest_lane)} and {lane_label(name)}; '
+                                    "only one lane can take the rest")
+                rest_lane = rest_lane or name
+            elif entry not in known:
+                problems.append(f"{lane_label(name)}: no load step is called {entry!r} (see 'plan' for the names)")
+            elif entry in placed:
+                problems.append(f"{entry} is in {lane_label(placed[entry])} and {lane_label(name)}; "
+                                "a step can be in one lane only")
+            else:
+                placed[entry] = name
+        layout.append((name, entries))
+    if not cfg.lanes:
+        problems.append("[lanes] enabled = true, but no lane is listed")
+    rest = [s for s in loads if s.id not in placed]
+    if rest and not rest_lane and layout:
+        problems.append(f"{len(rest)} load step(s) are in no lane and no lane lists \"*\" for the rest: "
+                        + ", ".join(s.id for s in rest[:5]) + (" ..." if len(rest) > 5 else ""))
+    if problems:
+        return [], problems, warnings
+
+    by_id = {s.id: s for s in loads}
+    grouped = []
+    for name, entries in layout:
+        steps = []
+        for entry in entries:
+            steps += rest if entry == REST else [by_id[entry]] if entry in by_id else []
+        if steps:
+            grouped.append((name, steps))
+
+    # Every step empties its tables before loading them, so two lanes loading one table would undo each other.
+    owner = {}
+    for name, steps in grouped:
+        for step in steps:
+            for table in loaded_tables(step):
+                first = owner.setdefault(table, (name, step.id))
+                if first[0] != name:
+                    problems.append(f"{table} is loaded by {first[1]} in {lane_label(first[0])} and by {step.id} in "
+                                    f"{lane_label(name)}; lanes run at the same time, so put both steps in one lane")
+    chunk_lanes = [name for name, steps in grouped if any(s.kind == "chunk" for s in steps)]
+    if len(chunk_lanes) > 1:
+        warnings.append(f"chunk scripts are in {len(chunk_lanes)} lanes ({', '.join(chunk_lanes)}), so two can run "
+                        "at once; each opens about PARALLEL_JOBS x (ORA_JOBS + PG_JOBS) connections on both databases")
+    return ([], problems, warnings) if problems else (grouped, [], warnings)
 
 
 def split_statements(text):

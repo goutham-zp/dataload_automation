@@ -121,6 +121,43 @@ Leave tmux with `Ctrl+B` then `D`. Come back with `tmux attach -t dataload`.
 
 `--only FOLDER` before the command limits everything to one schema folder.
 
+## Lanes: load steps side by side
+
+By default the load steps run one at a time. With `[lanes] enabled = true` in `dataload.toml`, the load steps are
+split into lanes: each lane runs its steps one at a time, in the order listed, and all lanes run at once. The
+load ends when the slowest lane ends. Drop, recreate and validation run as before, so constraints and indexes come
+back only after every lane has finished.
+
+```toml
+[lanes]
+enabled = true
+lane1 = ["FTS/ora2pg_set_5.conf"]
+lane2 = ["FTS/ora2pg_set_3.conf", "FTS/ora2pg_set_4.conf", "FTS/ora2pg_set_6.conf"]
+lane3 = ["FTS/A_EDI_DATA/run_A_EDI_DATA_1.sh", "..."]
+lane4 = ["FTS/ora2pg_set_7.conf", "*"]
+```
+
+- Steps are named as `plan` lists them. `"*"` stands for every load step that no other lane names, in the usual
+  order. Lane names are free (`lane1`, `big`, ...).
+- `plan` shows the lanes. `plan`, `preflight` and `run` refuse a layout with an unknown name, a step in two lanes,
+  a step in no lane, or one table loaded in two lanes (each step empties its tables first, so two lanes would undo
+  each other's rows). A table loaded by two steps of one lane is allowed, as without lanes.
+- Chunk scripts in more than one lane give a warning: each script alone opens about
+  `PARALLEL_JOBS x (ORA_JOBS + PG_JOBS)` connections on both databases.
+- A failed step does not stop its lane or the others. Each failure is mailed as usual.
+- `Ctrl+C` stops every lane. `resume` does only what is not done, with the lanes as they are in `dataload.toml`
+  at that moment, so the layout can be changed between a stop and a resume.
+- `status` shows the lane of every load step. The log names the lane on each step's first line
+  (`lane2: step 2 of 3: FTS/ora2pg_set_4.conf, ...`) and when a lane finishes.
+- With lanes on, `--allow-remaining-fks` is refused: a `TRUNCATE ... CASCADE` in one lane could empty a table
+  another lane is loading.
+- The stall check (no output for 15 minutes and both databases idle) only sees the whole database. While other
+  lanes keep the databases busy, a copy that lost its connection is not stopped until every lane is quiet. Watch
+  the "still running" lines of each step.
+
+Total connections are the sum over every step running at the same moment. Check them against PostgreSQL's
+`max_connections` and the Oracle account's session limit before the first run with lanes.
+
 ## When something goes wrong
 
 | What you see | Meaning | What to do |
@@ -128,7 +165,7 @@ Leave tmux with `Ctrl+B` then `D`. Come back with `tmux attach -t dataload`.
 | Email "Step failed" | One table or chunk ended in an error. The run carried on with the next one | Read the error with `status --failed`, fix the cause, `resume` |
 | "Stopped part-way" in status | The work was cut off by a stop. Nothing is wrong | `resume` |
 | "failed on a transient error, retry 2/3" in the log | A network or connection error. It is tried 3 times with a pause | Nothing |
-| "stalled" in the log | No output for 15 minutes and both databases idle. The copy is stopped and retried | Nothing |
+| "stalled" in the log | No output for 15 minutes and both databases idle. The copy is stopped and retried. With lanes, only once every lane is quiet | Nothing |
 | "load NOT started: foreign key(s)" | Foreign keys still point at tables that will be truncated | Drop them, `resume` |
 | "another dataload run is already in progress" | A run holds the lock | Use `status`; do not start a second one |
 | "load NOT started: session(s) are already copying" | ora2pg processes from an earlier run are still writing | Wait, or end them, then `resume` |

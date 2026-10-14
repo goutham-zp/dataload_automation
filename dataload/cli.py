@@ -57,7 +57,29 @@ def cmd_plan(cfg, _args):
             what = {"sql": "statements", "conf": "tables", "chunk": "chunks"}[s.kind]
             how = f"bash {s.path.name}" if s.kind == "chunk" else ("ora2pg -c" if s.kind == "conf" else "psql")
             print(f"{i:4}. {s.id:60} {len(s.units):5} {what:10} [{how}]")
-    return 0
+    lanes, problems, warnings = plan.lanes(cfg, loads)
+    if lanes:
+        print(f"\n== load lanes: {len(lanes)}, side by side ==")
+        for name, members in lanes:
+            print(f"{name}: {len(members)} step{'s' * (len(members) != 1)}, one after another")
+            for i, s in enumerate(members, 1):
+                print(f"{i:4}. {s.id}")
+    for w in warnings:
+        print(f"warning: {w}")
+    for p in problems:
+        print(f"lanes FAILED: {p}")
+    return 2 if problems else 0
+
+
+def lane_names(cfg):
+    """{load step: lane} from the settings as they are now; empty when lanes are off or cannot be worked out."""
+    if not cfg.lanes_enabled:
+        return {}
+    try:
+        lanes = plan.lanes(cfg, plan.load_steps(cfg))[0]
+    except (plan.PlanError, OSError):
+        return {}
+    return {s.id: name for name, members in lanes for s in members}
 
 
 def cmd_status(cfg, args):
@@ -113,13 +135,18 @@ def cmd_status(cfg, args):
             numbers = tally("s.phase = ?", (phase,))
             if numbers[0]:
                 print(f"{phase:10} {numbers[1]:>9,} / {numbers[0]:<9,} {describe(*numbers, skip=phase in skipped)}")
-        print("\nLoad steps")
-        for row in steps:
+        lane_of = lane_names(cfg)
+        width = max(map(len, lane_of.values()), default=0)
+        print(f"\nLoad steps, in {len(set(lane_of.values()))} lanes side by side" if lane_of else "\nLoad steps")
+        rank = {step_id: i for i, step_id in enumerate(lane_of)}   # lane by lane, each in its running order
+        phases = ("drop", "load", "recreate")
+        for row in sorted(steps, key=lambda r: (phases.index(r["phase"]), rank.get(r["id"], len(rank) + r["seq"]))):
             numbers = tally("s.id = ?", (row["id"],))
             what = "chunks" if row["kind"] == "chunk" else "tables" if row["kind"] == "conf" else "statements"
+            lane = f"{lane_of.get(row['id'], ''):{width}}  " if lane_of else ""
             # Drop and recreate have dozens of steps each; only the ones needing attention are listed.
             if row["phase"] == "load" or args.all or numbers[2]:
-                print(f"  {row['id']:58} {numbers[1]:>6,} / {numbers[0]:<6,} {what:10} "
+                print(f"  {lane}{row['id']:58} {numbers[1]:>6,} / {numbers[0]:<6,} {what:10} "
                       f"{describe(*numbers, skip=row['phase'] in skipped)}")
 
     WORD = {"chunk": "chunk", "conf": "table", "sql": "statement"}

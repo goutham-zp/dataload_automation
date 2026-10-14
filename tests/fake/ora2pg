@@ -3,7 +3,7 @@
 
 "Oracle" is a JSON file (FAKE_ORA_SOURCE) of {"SCHEMA.TABLE": row_count}; rows are ids 1..n.
 Faults come from a JSON list (FAKE_ORA_FAULTS) of {"match", "mode", "times"} where match is a
-table name or part of a --where condition, and mode is transient | fatal | exit0 | hang | stubborn | falsefail.
+table name or part of a --where condition, and mode is transient | fatal | exit0 | hang | stubborn | falsefail | slow.
 """
 import fcntl
 import json
@@ -94,10 +94,12 @@ def copy_tables(conf, opts, tables, source, schema, pg_schema):
         if conf.get("TRUNCATE_TABLE") == "1":
             psql(conf, f"TRUNCATE {target} CASCADE")
         rows = source.get(f"{schema}.{t}", 0)
-        partial = " AND id % 2 = 0" if mode and mode != "falsefail" else ""
+        partial = " AND id % 2 = 0" if mode and mode not in ("falsefail", "slow") else ""
         if rows:
             psql(conf, f"INSERT INTO {target} (id) SELECT id FROM generate_series(1, {rows}) "
                        f"AS g(id) WHERE ({where or 'TRUE'}){partial}")
+        if mode == "slow":        # a long copy that ends well, to see other lanes work meanwhile
+            time.sleep(8)
         print(f"[========================>] rows (100.0%) Table {t}")
         if mode == "transient":
             print("ERROR: ORA-08177: can't serialize access for this transaction")

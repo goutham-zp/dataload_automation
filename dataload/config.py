@@ -48,6 +48,8 @@ class Config:
     heartbeat: int = 60
     hide_values: bool = True
     email: dict = field(default_factory=dict)
+    lanes_enabled: bool = False
+    lanes: dict = field(default_factory=dict)   # lane name -> load step names, in the order they run
 
 
 def load_env_file(path):
@@ -72,6 +74,7 @@ def load(path):
     tools = raw.get("tools", {})
     retry = raw.get("retry", {})
     validate = raw.get("validate", {})
+    lanes = raw.get("lanes", {})
 
     def resolve(key, default):
         return (root / paths.get(key, default)).resolve()
@@ -101,4 +104,6 @@ def load(path):
         heartbeat=int(raw.get("output", {}).get("heartbeat_seconds", 60)),
         hide_values=bool(raw.get("output", {}).get("hide_values", True)),
         email=raw.get("email", {}),
+        lanes_enabled=bool(lanes.get("enabled", False)),
+        lanes={name: steps for name, steps in lanes.items() if name != "enabled"},
     )

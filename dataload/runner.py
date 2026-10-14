@@ -118,6 +118,7 @@ class Engine:
         self.target = ""
         self.source = ""
         self.stopped_pids = []
+        self.log_lock = threading.Lock()         # lanes log from several threads
         cfg.logs.mkdir(parents=True, exist_ok=True)
         cfg.work.mkdir(parents=True, exist_ok=True)
         cfg.report = cfg.report or cfg.root / "report.html"
@@ -132,9 +133,10 @@ class Engine:
 
     def log(self, message):
         line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}"
-        print(line, flush=True)
-        with open(self.cfg.logs / "dataload.log", "a") as f:
-            f.write(line + "\n")
+        with self.log_lock:
+            print(line, flush=True)
+            with open(self.cfg.logs / "dataload.log", "a") as f:
+                f.write(line + "\n")
 
     def install_signal_handlers(self):
         def handler(signum, _frame):
@@ -452,8 +454,8 @@ class Engine:
     # ---------- preflight ----------
 
     def preflight(self, loads):
-        problems, warnings = [], []
         cfg = self.cfg
+        _, problems, warnings = plan.lanes(cfg, loads)
 
         for tool in [cfg.ora2pg, cfg.psql, "bash"] + (["parallel"] if any(s.kind == "chunk" for s in loads) else []):
             if not shutil.which(tool):
@@ -750,7 +752,9 @@ class Engine:
                       "loading beside them would duplicate rows. Wait for them or stop them, then run 'resume'.")
             self.log(f"load NOT started: {reason}")
             return reason
-        if any(s.kind == "conf" for s in todo) and not self.flags.allow_remaining_fks:
+        lanes = plan.lanes(self.cfg, loads)[0]
+        # With lanes the check is never skipped: a cascade from one lane could empty a table another is loading.
+        if any(s.kind == "conf" for s in todo) and (lanes or not self.flags.allow_remaining_fks):
             truncated = ['"%s"."%s"' % (OraConf(s.conf_path).pg_schema(), u["key"].lower())
                          for s in todo if s.kind == "conf"
                          for u in self.state.units(s.id, only_unfinished=True)]
@@ -758,20 +762,68 @@ class Engine:
             if fks:
                 reason = (f"{len(fks)} foreign key(s) still reference the tables being loaded "
                           f"(e.g. {', '.join(fks[:3])}). The confs use TRUNCATE ... CASCADE, which would "
-                          "empty the referencing tables. Drop them, or pass --allow-remaining-fks.")
+                          "empty the referencing tables. Drop them" + (
+                              "; with lanes on, --allow-remaining-fks is not accepted, because the cascade "
+                              "could empty a table another lane is loading." if lanes
+                              else ", or pass --allow-remaining-fks."))
                 self.log(f"load NOT started: {reason}")
                 return reason
         started = time.time()
-        for i, s in enumerate(todo, 1):
-            what = "chunks" if s.kind == "chunk" else "tables"
-            self.log(f"load step {i} of {len(todo)}: {s.id}, "
-                     f"{len(self.state.units(s.id, only_unfinished=True))} of {len(s.units)} {what} to do")
-            step_started = time.time()
-            (self.run_chunk_step if s.kind == "chunk" else self.run_conf_step)(s)
-            if s.kind == "chunk":
-                self.count_chunked(s)
-            self.report_step(s.id, step_started)
+        if lanes:
+            self.run_lanes(lanes, {s.id for s in todo})
+        else:
+            for i, s in enumerate(todo, 1):
+                self.log(f"load step {i} of {len(todo)}: {self.step_line(s)}")
+                self.run_load_step(s)
         self.phase_finished("load", started)
+
+    def step_line(self, step):
+        what = "chunks" if step.kind == "chunk" else "tables"
+        return f"{step.id}, {len(self.state.units(step.id, only_unfinished=True))} of {len(step.units)} {what} to do"
+
+    def run_load_step(self, step):
+        started = time.time()
+        (self.run_chunk_step if step.kind == "chunk" else self.run_conf_step)(step)
+        if step.kind == "chunk":
+            self.count_chunked(step)
+        self.report_step(step.id, started)
+
+    def run_lanes(self, lanes, waiting):
+        """Each lane runs its unfinished steps one after another, all lanes at the same time. A failed step
+        does not stop its lane or the others, just as a failed step does not stop a load without lanes."""
+        work = [(name, [s for s in steps if s.id in waiting]) for name, steps in lanes]
+        work = [(name, steps) for name, steps in work if steps]
+        self.log(f"load runs in {len(work)} lane{'s' * (len(work) != 1)} side by side: "
+                 + ", ".join(f"{name} ({len(steps)} step{'s' * (len(steps) != 1)})" for name, steps in work))
+        crashed = []
+
+        def lane(name, steps):
+            started = time.time()
+            try:
+                for i, s in enumerate(steps, 1):
+                    self.log(f"{name}: step {i} of {len(steps)}: {self.step_line(s)}")
+                    self.run_load_step(s)
+            except Stopped:
+                return
+            except Exception as e:  # noqa: BLE001 - reported once the other lanes have ended
+                crashed.append(e)
+                self.log(f"{name}: stopped by an unexpected error: {e!r}")
+                return
+            failed = sum(len(self.state.failed_units(step_id=s.id)) for s in steps)
+            self.log(f"{name}: finished in {human(time.time() - started)}"
+                     + (f", {failed} unit(s) failed" if failed else ", all steps done"))
+
+        threads = [threading.Thread(target=lane, args=item, name=f"lane {item[0]}", daemon=True) for item in work]
+        for t in threads:
+            t.start()
+        # Joined with a timeout, so the main thread stays free to take Ctrl+C and pass the stop to every lane.
+        while any(t.is_alive() for t in threads):
+            for t in threads:
+                t.join(timeout=1)
+        if self.stopping:
+            raise Stopped()
+        if crashed:
+            raise crashed[0]
 
     def count_chunked(self, step):
         """Once every chunk of a table is in, compare both sides inside the loaded ranges."""

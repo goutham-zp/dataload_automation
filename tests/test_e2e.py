@@ -441,6 +441,104 @@ outbox = "outbox"
         self.assertEqual(self.dataload("run"), 0, self.output)
         self.assert_everything_loaded()
 
+    # ----- lanes -----
+
+    LANES = {"big": ["ALPHA/BIG/run_BIG.sh"], "rest": ["*"]}
+
+    def use_lanes(self, enabled=True, **lanes):
+        lines = ["", "[lanes]", f"enabled = {str(enabled).lower()}"]
+        lines += [f"{name} = {json.dumps(steps)}" for name, steps in lanes.items()]
+        toml = self.tmp / "dataload.toml"
+        toml.write_text(toml.read_text() + "\n".join(lines) + "\n")
+
+    def test_lanes_run_side_by_side_and_recreate_waits_for_all_of_them(self):
+        self.use_lanes(**self.LANES)
+        self.set_faults([{"match": "ID BETWEEN 1 AND 25", "mode": "slow", "times": 1}])
+        self.assertEqual(self.dataload("plan"), 0, self.output)
+        self.assertIn("== load lanes: 2, side by side ==", self.output)
+        self.assertIn("rest: 3 steps", self.output)
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        out = self.output
+        self.assertIn("load runs in 2 lanes side by side: big (1 step), rest (3 steps)", out)
+        self.assertIn("rest: step 1 of 3: ALPHA/ora2pg_set_1.conf, 2 of 2 tables to do", out)
+        self.assertIn("big: step 1 of 1: ALPHA/BIG/run_BIG.sh, 4 of 4 chunks to do", out)
+        self.assertLess(out.index("rest: finished"), out.index("big: finished"), "the small steps waited for the chunks")
+        self.assertLess(out.index("big: finished"), out.index("phase load finished"))
+        self.assertLess(out.index("phase load finished"), out.index("recreate/"))
+        self.assertEqual(self.subjects(), ["Phase finished: drop", "Phase finished: load",
+                                           "Phase finished: recreate", "Run finished: all done"])
+        self.dataload("status")
+        self.assertRegex(self.output, r"big\s+ALPHA/BIG/run_BIG\.sh\s+4 / 4\s+chunks\s+done")
+        self.assertRegex(self.output, r"rest\s+BETA/ora2pg_set_1\.conf\s+1 / 1\s+tables\s+done")
+
+    def test_a_failure_in_one_lane_leaves_the_other_lanes_running(self):
+        self.use_lanes(**self.LANES)
+        self.set_faults([{"match": "T2", "mode": "fatal", "times": 99}])
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.assertEqual(self.count("(SELECT DISTINCT id FROM alpha.big) d"), 100)
+        self.assertEqual(self.count("alpha.t3"), 5, "the lane with the failure carries on with its next step")
+        self.assertEqual(self.count("beta.b1"), 8)
+        self.assertIn("rest: finished in", self.output)
+        self.assertIn(", 1 unit(s) failed", self.output)
+        self.assertIn("recreate NOT started", self.output)
+        self.assertIn("Step failed: ALPHA/ora2pg_set_1.conf", self.subjects())
+        self.set_faults([])
+        self.calls.write_text("")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assertEqual(self.loaded_tables(), ["T2"])
+        self.assert_everything_loaded()
+
+    def test_stop_halts_every_lane_and_resume_finishes_them(self):
+        self.use_lanes(**self.LANES)
+        self.set_faults([{"match": "T3", "mode": "hang", "times": 1},
+                         {"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])
+        proc = subprocess.Popen(self.argv("run"), env=self.env, cwd=self.tmp, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True)
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            calls = self.calls.read_text()
+            if "T3|" in calls and "|ID BETWEEN 51 AND 75" in calls:
+                break
+            time.sleep(0.2)
+        time.sleep(1.5)  # both lanes are now in the middle of a copy
+        proc.send_signal(signal.SIGINT)
+        out, _ = proc.communicate(timeout=60)
+        self.assertEqual(proc.returncode, 130, out)
+        left = subprocess.run(["pgrep", "-fl", str(self.tmp)], capture_output=True, text=True).stdout
+        self.assertEqual(left, "", "nothing may keep copying in any lane after a stop")
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+        calls = self.calls.read_text()
+        self.assertEqual(calls.count("T3|"), 2)
+        self.assertEqual(calls.count("|ID BETWEEN 51 AND 75"), 2)
+        self.assertEqual(calls.count("T1|"), 1, "steps that had finished are not repeated")
+
+    def test_a_table_in_two_lanes_stops_the_run_before_anything_changes(self):
+        (self.tmp / "content" / "ALPHA" / "ora2pg_set_2.conf").write_text(conf_text("ALPHA", ["T3", "T1"]))
+        self.use_lanes(a=["ALPHA/ora2pg_set_1.conf"], b=["*"])
+        self.assertEqual(self.dataload("run"), 2, self.output)
+        self.assertIn("preflight FAILED: alpha.t1 is loaded by ALPHA/ora2pg_set_1.conf in lane a", self.output)
+        self.assertEqual(self.loaded_tables(), [])
+        self.assertEqual(int(sql(CONSTRAINTS_SQL)), self.all_constraints)
+        self.assertEqual(self.dataload("plan"), 2, self.output)
+        self.assertIn("alpha.t1 is loaded by", self.output)
+
+    def test_lanes_never_load_beside_a_foreign_key(self):
+        self.use_lanes(**self.LANES)
+        self.assertEqual(self.dataload("run", "--skip-constraints", "--allow-remaining-fks"), 1, self.output)
+        self.assertIn("with lanes on, --allow-remaining-fks is not accepted", self.output)
+        self.assertEqual(self.loaded_tables(), [])
+
+    def test_lanes_listed_but_switched_off_run_one_step_at_a_time(self):
+        self.use_lanes(enabled=False, **self.LANES)
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        self.assertIn("load step 1 of 4: ALPHA/ora2pg_set_1.conf, 2 of 2 tables to do", self.output)
+        self.assertNotIn("side by side", self.output)
+        self.assertEqual(self.loaded_tables()[:3], ["T1", "T2", "T3"])
+        self.assertEqual(self.loaded_tables()[-1], "B1")
+
     def test_second_run_is_refused_and_wrong_target_stops_preflight(self):
         toml = self.tmp / "dataload.toml"
         good = toml.read_text()
