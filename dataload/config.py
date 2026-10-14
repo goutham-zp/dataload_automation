@@ -50,6 +50,9 @@ class Config:
     email: dict = field(default_factory=dict)
     lanes_enabled: bool = False
     lanes: dict = field(default_factory=dict)   # lane name -> load step names, in the order they run
+    oracle_rows: str = ""                       # tests only: stands in for the Perl helper sequences.py writes
+    sequence_links: Path = None                 # extra sequence -> column links for 'dataload.sequences check'
+    sequence_check_timeout: float = 120         # seconds one column's max() may take in that check
 
 
 def load_env_file(path):
@@ -75,6 +78,7 @@ def load(path):
     retry = raw.get("retry", {})
     validate = raw.get("validate", {})
     lanes = raw.get("lanes", {})
+    sequences = raw.get("sequences", {})
 
     def resolve(key, default):
         return (root / paths.get(key, default)).resolve()
@@ -106,4 +110,7 @@ def load(path):
         email=raw.get("email", {}),
         lanes_enabled=bool(lanes.get("enabled", False)),
         lanes={name: steps for name, steps in lanes.items() if name != "enabled"},
+        oracle_rows=tools.get("oracle_rows", ""),
+        sequence_links=(root / sequences.get("links", "sequence_links.txt")).resolve(),
+        sequence_check_timeout=float(sequences.get("check_timeout_seconds", 120)),
     )

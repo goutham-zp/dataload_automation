@@ -158,6 +158,40 @@ lane4 = ["FTS/ora2pg_set_7.conf", "*"]
 Total connections are the sum over every step running at the same moment. Check them against PostgreSQL's
 `max_connections` and the Oracle account's session limit before the first run with lanes.
 
+## Sequences after the load
+
+A data load copies rows with their IDs, so it never moves a sequence. `dataload.sequences` sets every
+PostgreSQL sequence to Oracle's value. It is a separate command, not a phase: run it once Oracle writes have
+stopped, after the load.
+
+```
+python3 -m dataload.sequences plan          # dry run: what would change and why; changes nothing
+python3 -m dataload.sequences apply         # asks, sets what is behind Oracle, then runs the check
+python3 -m dataload.sequences apply --yes   # the same without asking (needed when there is no terminal)
+python3 -m dataload.sequences check         # compares each sequence with the highest value in its columns
+```
+
+- **Matching.** Named sequences are matched by schema and name. Identity columns are matched by table and column,
+  because their names never match (`ISEQ$$_647701` on Oracle, `segment_rule_history_history_id_seq` here).
+  Schemas are the `SCHEMA` / `PG_SCHEMA` pairs in the confs; connections come from the confs too.
+- **Value.** Oracle's `LAST_NUMBER`, so the next insert gets exactly that number. A sequence already at or past
+  it is left alone: nothing ever moves back (for a descending sequence, "back" is up). Running again is safe and
+  only moves what fell behind.
+- **Refused, with the reason in the output:** Oracle's value outside the PostgreSQL sequence's range (an `integer`
+  sequence), a different increment, a PostgreSQL sequence two Oracle sequences point at, no UPDATE privilege.
+- **Only on one side:** listed, never created or dropped.
+- **Oracle still in use:** `apply` reads Oracle again at the end. Sequences that moved meanwhile are listed and the
+  exit code is 1; run `apply` again once writes have stopped.
+- **Check.** Every column fed by a sequence (identity, OWNED BY, column default, plus `sequence_links.txt` for
+  links PostgreSQL cannot see: Oracle triggers, packages, the application's ORM) against that sequence's next
+  value. `placeholder` means an all-nines marker row, the same as on Oracle. `needs a look` means a row already
+  holds a value the sequence will hand out. The check changes nothing.
+- **Output.** A summary on screen and CSV files in `logs/` (`sequences-plan-*.csv`, `sequences-apply-*.csv`,
+  `sequences-check-*.csv`). No row data is printed, only sequence numbers and IDs.
+- **Exit code.** 0 clean, 1 something to look at (a failure, Oracle moved, or check findings), 2 did not run.
+  It refuses to run when the confs point somewhere other than `[target] expected`, and `apply` refuses when that
+  is not set.
+
 ## When something goes wrong
 
 | What you see | Meaning | What to do |
@@ -209,6 +243,7 @@ One mail when a run resumes, one for each failed step, one at the end of each ph
 | `logs/` | One log per step and attempt, with ora2pg's full output |
 | `work/` | Temporary conf copies and remaining-chunk files |
 | `report.html` | Rows and sizes before and after, per table |
+| `logs/sequences-*.csv` | What `dataload.sequences` found and did, one row per sequence or column |
 
 ## Tests
 

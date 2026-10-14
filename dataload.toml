@@ -63,6 +63,11 @@ lane3 = [
 lane4 = ["FTS/ora2pg_set_7.conf", "FAST/ora2pg_set_1.conf", "FTS/ora2pg_set_8.conf",
          "FAST_TRACK/ora2pg_fast_track_set.conf", "SECADMIN/ora2pg_set_1.conf", "*"]
 
+[sequences]
+# For 'python3 -m dataload.sequences check'. Extra sequence -> column links the PostgreSQL catalogue cannot see.
+links = "sequence_links.txt"
+check_timeout_seconds = 120    # one column's max() may take this long, then it is reported as not checked
+
 [preflight]
 perl_dbd_pg = true
 

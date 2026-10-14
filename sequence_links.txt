@@ -1,0 +1,64 @@
+# Extra sequence -> column links for "python3 -m dataload.sequences check".
+# The check already reads identity, OWNED BY and column defaults from PostgreSQL; these are the links it cannot see:
+# columns filled by an Oracle trigger, package or procedure, or by the application through its ORM mapping.
+# Format: schema.sequence  schema.table.column   (anything after # is ignored)
+# Source: Oracle_sequence_column_map.xlsx, 13 Oct 2026.
+
+fast.approved_old_invoice_audit_detail_seq  fts.approved_old_invoice_audit_detail.id                       # Oracle trigger
+fast.dw_report_definition_id_seq            fast.dw_report_definition.dw_report_definition_id              # application ORM mapping
+fast.elmah$error_seq                        fast.elmah$error.sequencenumber                                # Oracle trigger
+fast.inv_recon_data_file_type_seq           fast.invoice_recon_data_file_type.inv_recon_data_file_type_id  # application ORM mapping
+fast.invoice_match_seq                      fast.invoice_match.invoice_match_id                            # application ORM mapping
+fast.po_inv_type_retailer_id_seq            fast.po_invoice_type_retailer.po_invoice_type_retailer_id      # application ORM mapping
+fast_track.distributor_rep_divisions_seq    fast_track.distributor_rep_divisions.dist_rep_division_id      # application ORM mapping
+fast_track.elmah$error_seq                  fast_track.elmah$error.sequencenumber                          # Oracle trigger
+fast_track.retailer_esign_id_seq            fast_track.retailer_esign.retailer_esign                       # application ORM mapping
+ft.b2b_automated_payment_seq                ft.b2b_automated_payment.b2b_automated_payment_seq             # Oracle trigger
+ft.bank_seq                                 ft.bank_information.ft_bank_id                                 # Oracle trigger
+ft.ft_incident_seq                          ft.incident_log.ft_incident_seq                                # Oracle trigger
+ft.group_sequence                           ft.b2b_group_log.group_sequence                                # Oracle trigger
+ft.isa_sequence                             ft.b2b_interchange_log.isa_sequence                            # Oracle trigger
+ft.trans_sequence                           ft.b2b_trans_log.trans_sequence                                # Oracle trigger
+ftms.seq_dept_id                            ftms.user_departments.dept_id                                  # Oracle trigger
+ftms.seq_user_id                            ftms.user_base.user_id                                         # Oracle trigger
+ftms.seq_user_set_id                        ftms.user_settings.user_set_id                                 # Oracle trigger
+fts.a_po_inv_sum_po_invoice_id_seq          fts.a_po_invoice_summary.po_invoice_id                         # Oracle package
+fts.a_po_invoice_data_id_seq                fts.a_po_invoice_data.po_invoice_data_id                       # Oracle package
+fts.a_setup_tracking_hist_id_seq            fts.a_setup_tracking_history.history_id                        # Oracle procedure
+fts.billing_invoice                         new_billing.billing_invoice_numbers.billing_invoice_no         # Oracle package
+fts.billing_schedule                        fts.r_pricing_schedule_summary.fts_schedule_no                 # application ORM mapping
+fts.edidata                                 fts.a_edi_data.fts_item_no                                     # Oracle trigger
+fts.edidata                                 fts.a_edi_data_hold.fts_item_no                                # Oracle trigger
+fts.fts_email_id                            fts.customer_email.fts_email_id                                # Oracle trigger
+fts.fts_store_id_seq                        fts.r_store.fts_store_id                                       # Oracle trigger
+fts.fts_tip_id_seq                          fts.corp_tips.fts_tip_id                                       # Oracle trigger
+fts.incident                                fts.a_incident_log.incident_id                                 # Oracle trigger
+fts.incident_remarks                        fts.a_incident_remarks.remarks_id                              # Oracle trigger
+fts.invoice                                 fts.a_edi_summary.fts_invoice_no                               # Oracle trigger
+fts.invoice_review                          fts.a_invoice_review.fts_invoice_review_no                     # Oracle trigger
+fts.manual_invoice                          fts.a_manual_invoices.fts_manual_invoice_nbr                   # Oracle trigger
+fts.microsoftseqdtproperties                fts.microsoftdtproperties.id                                   # Oracle procedure
+fts.migration_offer_id_seq                  fts.migration_offer.migration_offer_id                         # Oracle package
+fts.migration_offer_id_seq                  fts.migration_offer_errors.migration_offer_error_id            # Oracle package
+fts.nacha_id                                fts.a_cc_processed.fts_nacha_id                                # Oracle package
+fts.newsletters_seq                         fts.corp_newsletters.nl_id                                     # Oracle trigger
+fts.r_company_rep_hist_seq                  fts.r_company_rep_history.r_company_rep_history_id             # application ORM mapping
+fts.r_store_attr_seq                        fts.r_store_attr.r_store_attr_id                               # Oracle trigger
+fts.retailer_cards_hist_id_seq              fts.retailer_cards_history.history_id                          # Oracle package
+fts.rpt_pc_snapshot_seq                     fts.rpt_pc_snapshot.field_number                               # Oracle trigger
+fts.rpt_qt_snapshot_seq                     fts.rpt_qt_snapshot.field_number                               # Oracle trigger
+fts.sac_data_seq                            fts.sac_data.fts_sac_id                                        # Oracle trigger
+fts.sac_data_seq                            fts.sac_data_hold.fts_sac_id                                   # Oracle trigger
+fts.sales_projection_adjst_seq              fts.sales_projection_adjst.sales_adjustment_seq                # Oracle trigger
+fts.store_bill_history_seq                  fts.a_store_billing_history.store_bill_history_seq             # Oracle trigger
+fts.www_errors_seq                          fts.www_errors.www_errors_id                                   # Oracle trigger
+fts.www_login_seq                           fts.www_login.www_login                                        # Oracle trigger
+fts.www_login_store_id_seq                  fts.www_login_store.www_login_store_id                         # application ORM mapping
+fts.x_van_transmission_seq                  fts.x_van_transmission.x_van_transmission_seq                  # Oracle trigger
+pricesource.daily_successful_map_id_seq     pricesource.daily_successful_map.daily_successful_map_id       # Oracle package
+pricesource.dist_promo_id                   pricesource.distributor_promotion.promo_id                     # Oracle procedure
+
+# Second tables of shared sequences, found in the sequence review and the application mappings (13-14 Oct 2026).
+fast.terms_acceptance_seq                   fast.fms_terms_acceptance.terms_id                             # shared with fast.terms_acceptance
+fts.bank_returns                            fts.fintech_nacha_bank.ft_nacha_bank_id                        # application ORM mapping
+pricesource.retlr_template_id               pricesource.retailer_template_setup.retlr_template_id          # application ORM mapping

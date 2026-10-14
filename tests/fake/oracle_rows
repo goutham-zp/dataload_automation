@@ -1,0 +1,22 @@
+#!/usr/bin/env python3
+"""Stand-in for the Oracle sequence reader, used only by the tests.
+
+Answers any query with the rows in FAKE_ORA_SEQUENCES (a JSON list of
+[owner, name, last_number, increment_by, table_name, column_name]). From the second call on it answers
+from FAKE_ORA_SEQUENCES_LATER instead, if that file exists: Oracle still being written to.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.stdin.read()
+calls = Path(os.environ["FAKE_ORA_SEQUENCES"] + ".calls")
+number = int(calls.read_text() or 0) + 1 if calls.exists() else 1
+calls.write_text(str(number))
+source = Path(os.environ["FAKE_ORA_SEQUENCES"])
+later = Path(os.environ.get("FAKE_ORA_SEQUENCES_LATER", "/nonexistent"))
+if number > 1 and later.exists():
+    source = later
+for row in json.loads(source.read_text()):
+    print("\t".join(["ROW"] + ["" if v is None else str(v) for v in row]))
