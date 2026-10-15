@@ -560,6 +560,16 @@ class Engine:
             return 2
         self.log(f"preflight passed, target {self.target}")
 
+        if state.run_info() is not None:
+            # A resume would run the new ranges beside the old ones, and chunked tables are never truncated.
+            changed = [s.id for s in loads if s.kind == "chunk" and state.units(s.id)
+                       and {u["key"] for u in state.units(s.id)} != set(s.units)]
+            if changed:
+                self.log("resume refused: the chunk file of " + ", ".join(changed) + " changed since this run "
+                         "started, so old and new ranges could load the same rows twice. Start over with "
+                         "'run --new', or put the old chunk file back (dataload.chunks keeps it as .bak-<time>).")
+                return 2
+
         resumed = state.begin(self.target)
         state.set_flags(self.flags.skipped)
         if self.flags.skipped:

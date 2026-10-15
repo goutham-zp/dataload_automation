@@ -192,6 +192,35 @@ python3 -m dataload.sequences check         # compares each sequence with the hi
   It refuses to run when the confs point somewhere other than `[target] expected`, and `apply` refuses when that
   is not set.
 
+## Chunk files
+
+`dataload.chunks` works out the chunks of every table loaded by a `run_*.sh` and writes them to that script's
+chunk file (`chunks.txt`, or whatever `CHUNKS_FILE` names). The old file is kept beside it as
+`chunks.txt.bak-<date>-<time>`.
+
+```
+python3 -m dataload.chunks check                  # each table, its ID column and index; reads no table data
+python3 -m dataload.chunks make                   # asks, then cuts every chunked table into up to 100 chunks
+python3 -m dataload.chunks make --chunks 120 --table SAC_DATA --yes
+```
+
+- **How it cuts.** Chunks hold equal row counts: each one ends at the highest of the next N IDs, so gaps in the
+  IDs do not matter. N is the row count divided by `--chunks`, rounded up, so there are never more chunks than
+  asked for. `--chunks` cannot go above 120.
+- **Nothing falls through.** Lines are written like the old files, `ID BETWEEN low AND high`. The first
+  starts at the table's lowest ID, each next one at the previous end plus one, and the last ends at the
+  largest value the column can hold (`9999999999` for a `NUMBER(10)`), so every row is in exactly one chunk.
+  This needs whole-number IDs: a column that can hold decimals, and rows that have them, are refused.
+- **The ID column** is the one the current chunk file uses, else the table's one-column primary key, else
+  `--column TABLE=COLUMN`.
+- **It refuses** a table with rows that have no ID, IDs with decimals, an ID column no index starts with (every
+  chunk would read the whole table), and anything while a run holds the lock. A table that fails keeps its old file; the
+  others are still written.
+- `make` reads every ID of each table once, one Oracle session per table, all tables at the same time
+  (`--workers 1` for one at a time). Run it when the DBA says.
+- After `make`, start the load with `run --new`. `resume` refuses chunk files that changed since its run
+  started, because old and new ranges could load the same rows twice.
+
 ## When something goes wrong
 
 | What you see | Meaning | What to do |
@@ -228,6 +257,7 @@ If `status` does not say the run is active and it is not finished, run `resume`.
 - Delete or edit anything in `state/`. It is the record of what is done.
 - Use `run --new` after a partial load without emptying the chunk-loaded tables first.
 - Edit a conf's table list in the middle of a run.
+- Change a chunk file in the middle of a run (`resume` refuses it).
 
 ## Emails
 
@@ -244,6 +274,7 @@ One mail when a run resumes, one for each failed step, one at the end of each ph
 | `work/` | Temporary conf copies and remaining-chunk files |
 | `report.html` | Rows and sizes before and after, per table |
 | `logs/sequences-*.csv` | What `dataload.sequences` found and did, one row per sequence or column |
+| `logs/chunks.log` | What `dataload.chunks` did, with times |
 
 ## Tests
 

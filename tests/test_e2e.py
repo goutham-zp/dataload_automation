@@ -307,6 +307,33 @@ outbox = "outbox"
         self.assertEqual(calls.count("|ID BETWEEN 51 AND 75"), 2, "the interrupted chunk runs again")
         self.assertEqual(calls.count("BIG|"), 5, "chunks that had finished before the stop are not repeated")
 
+    def test_chunk_lines_written_by_dataload_chunks_load_every_row_once(self):
+        chunk_file = self.tmp / "content" / "ALPHA" / "BIG" / "chunks.txt"
+        # As make writes them: from the lowest ID, each next one at the end plus one, the last to the column's ceiling.
+        chunk_file.write_text("ID BETWEEN 1 AND 30\nID BETWEEN 31 AND 60\nID BETWEEN 61 AND 90\nID BETWEEN 91 AND 9999999999\n")
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        self.assertEqual(self.count("alpha.big"), 100, "no row twice")
+        self.assertIn("run_BIG.sh: BIG: oracle=100 postgres=100 equal", (self.tmp / "logs" / "dataload.log").read_text())
+        calls = self.calls.read_text()
+        for line in chunk_file.read_text().splitlines():
+            self.assertIn(f"BIG|{line}\n", calls)
+
+    def test_resume_refuses_a_chunk_file_that_changed_since_the_run_started(self):
+        self.set_faults([{"match": "ID BETWEEN 76 AND 9999", "mode": "fatal", "times": 99}])
+        self.assertNotEqual(self.dataload("run"), 0, self.output)
+        chunk_file = self.tmp / "content" / "ALPHA" / "BIG" / "chunks.txt"
+        original = chunk_file.read_text()
+        chunk_file.write_text("ID <= 60\nID > 60\n")
+        calls = self.calls.read_text()
+        self.assertEqual(self.dataload("resume"), 2, self.output)
+        self.assertIn("resume refused: the chunk file of ALPHA/BIG/run_BIG.sh changed", self.output)
+        self.assertEqual(self.calls.read_text(), calls, "nothing was loaded")
+        self.set_faults([])
+        chunk_file.write_text(original)
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        self.assert_everything_loaded()
+
     def test_status_tells_a_stop_from_a_failure(self):
         self.set_faults([{"match": "T2", "mode": "fatal", "times": 99},
                          {"match": "ID BETWEEN 51 AND 75", "mode": "hang", "times": 1}])

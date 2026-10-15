@@ -1,0 +1,65 @@
+#!/usr/bin/env python3
+"""Stand-in for the Oracle query helper of dataload.chunks, used only by the tests.
+
+Answers the few queries chunks.py asks from FAKE_ORA_TABLES, a JSON object such as
+{"ALPHA.BIG": {"column": "ID", "ids": [1, 2, 5], "type": "NUMBER", "precision": 10, "scale": 0,
+               "nullable": "N", "index": "BIG_PK", "pk": ["ID"], "num_rows": 3, "fail": "ORA-01555: snapshot too old"}}
+"precision" and "scale" default to none (a plain NUMBER).
+"fail" makes the table's row reads fail. Every query is appended to FAKE_ORA_QUERY_LOG when it is set.
+"""
+import json
+import os
+import re
+import sys
+from decimal import Decimal
+from pathlib import Path
+
+tables = json.loads(Path(os.environ["FAKE_ORA_TABLES"]).read_text())
+log = os.environ.get("FAKE_ORA_QUERY_LOG")
+
+
+def answer(ident, rows):
+    for row in rows:
+        print("\t".join([ident, "ROW"] + ["" if v is None else str(v) for v in row]))
+    print(f"{ident}\tEND", flush=True)
+
+
+def text(value):
+    return None if value is None else str(Decimal(str(value)).normalize() if "." in str(value) else value)
+
+
+for line in sys.stdin:
+    ident, _, query = line.rstrip("\n").partition("\t")
+    if log:
+        with open(log, "a") as f:
+            f.write(query + "\n")
+    owner_table = re.search(r"owner = '(\w+)' AND \w+\.table_name = '(\w+)'", query)
+    if "all_constraints" in query:
+        t = tables.get(f"{owner_table.group(1)}.{owner_table.group(2)}", {})
+        pk = t.get("pk", [])
+        answer(ident, [[min(pk) if pk else None, len(pk)]])
+        continue
+    if "all_tab_columns" in query:
+        t = tables.get(f"{owner_table.group(1)}.{owner_table.group(2)}")
+        column = re.search(r"column_name = '(\w+)'$", query).group(1)
+        if not t or t["column"] != column:
+            answer(ident, [])
+        else:
+            answer(ident, [[t.get("type", "NUMBER"), t.get("nullable", "N"), t.get("index", ""),
+                            t.get("num_rows", len(t["ids"])), "2026-10-01", t.get("precision"), t.get("scale")]])
+        continue
+    name = re.search(r'FROM "(\w+)"\."(\w+)"', query)
+    t = tables[f"{name.group(1)}.{name.group(2)}"]
+    if t.get("fail"):
+        print(f"{ident}\tERROR\t{t['fail']}", flush=True)
+        continue
+    ids = [x for x in t["ids"] if x is not None]
+    if "COUNT(1) - COUNT(" in query:
+        fractions = sum(1 for x in ids if Decimal(str(x)) != Decimal(str(x)).to_integral_value())
+        answer(ident, [[len(t["ids"]), len(t["ids"]) - len(ids), text(min(ids)) if ids else None,
+                        text(max(ids)) if ids else None, fractions if "TRUNC(" in query else 0]])
+        continue
+    m = re.search(r"WHERE \"\w+\" (>=|>) (\S+) ORDER BY .* ROWNUM <= (\d+)", query)
+    op, after, size = m.group(1), Decimal(m.group(2)), int(m.group(3))
+    picked = sorted(x for x in ids if (Decimal(str(x)) >= after if op == ">=" else Decimal(str(x)) > after))[:size]
+    answer(ident, [[text(max(picked)) if picked else None]])
