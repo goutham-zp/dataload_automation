@@ -119,6 +119,9 @@ class Engine:
         self.source = ""
         self.stopped_pids = []
         self.log_lock = threading.Lock()         # lanes log from several threads
+        self.schema_lock = threading.Lock()      # lanes end steps of the same schema from several threads
+        self.schema_left = {}                    # schema -> load steps of this start not ended yet
+        self.schema_started = {}                 # schema -> when its first step of this start began
         cfg.logs.mkdir(parents=True, exist_ok=True)
         cfg.work.mkdir(parents=True, exist_ok=True)
         cfg.report = cfg.report or cfg.root / "report.html"
@@ -778,6 +781,10 @@ class Engine:
                               else ", or pass --allow-remaining-fks."))
                 self.log(f"load NOT started: {reason}")
                 return reason
+        # A schema's mail goes out when the last of its steps in this start has ended, in whichever lane.
+        self.schema_left = {}
+        for s in todo:
+            self.schema_left.setdefault(s.schema, set()).add(s.id)
         started = time.time()
         if lanes:
             self.run_lanes(lanes, {s.id for s in todo})
@@ -793,10 +800,49 @@ class Engine:
 
     def run_load_step(self, step):
         started = time.time()
+        with self.schema_lock:
+            self.schema_started.setdefault(step.schema, started)
         (self.run_chunk_step if step.kind == "chunk" else self.run_conf_step)(step)
         if step.kind == "chunk":
             self.count_chunked(step)
         self.report_step(step.id, started)
+        self.schema_step_ended(step)
+
+    def schema_step_ended(self, step):
+        with self.schema_lock:
+            left = self.schema_left.get(step.schema)
+            if not left or step.id not in left:
+                return
+            left.discard(step.id)
+            if left:
+                return
+        self.report_schema(step.schema)
+
+    def report_schema(self, schema):
+        """Every load step of the schema has ended: one mail with how it went."""
+        ids = [r["id"] for r in self.state.steps("load") if r["schema"] == schema]
+        c = self.state.counts(f"s.id IN ({', '.join('?' * len(ids))})", ids)
+        failed = [u for u in self.state.failed_units(phase="load") if u["step_id"] in ids]
+        checked = [v for v in self.state.validations() if v["step_id"] in ids]
+        different = [f"- {schema.upper()}.{v['tbl']}: oracle={v['ora_count']:,} postgres={v['pg_count']:,}"
+                     for v in checked if v["ora_count"] != v["pg_count"]
+                     and f"{schema.upper()}.{v['tbl']}" not in self.cfg.validate_ignore]
+        took = human(time.time() - self.schema_started.get(schema, time.time()))
+        self.log(f"schema {schema}: all load steps ended in {took}, {c.get('done', 0)} of {sum(c.values())} "
+                 f"done, {len(failed)} failed, {len(different)} row count(s) different")
+        if not self.cfg.email.get("schema_finished", True):
+            return
+        body = (f"Target: {self.target}\nSchema: {schema}\nTook: {took}\n"
+                f"Load steps: {len(ids)}\n"
+                f"Tables and chunks: {c.get('done', 0):,} of {sum(c.values()):,} done, {len(failed):,} failed\n"
+                f"Rows: Oracle {sum(v['ora_count'] or 0 for v in checked):,}, "
+                f"PostgreSQL {sum(v['pg_count'] or 0 for v in checked):,} ({len(checked)} tables counted)")
+        if different:
+            body += "\n\nRow counts that differ:\n" + "\n".join(different[:30])
+        if failed:
+            body += "\n\nFailed:\n" + self.describe(failed)
+        body += f"\n\nWhole run so far:\n{self.summary()}"
+        self.notifier.send(f"Schema finished: {schema}" + (" (with failures)" if failed or different else ""), body)
 
     def run_lanes(self, lanes, waiting):
         """Each lane runs its unfinished steps one after another, all lanes at the same time. A failed step

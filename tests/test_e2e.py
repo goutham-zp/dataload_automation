@@ -178,8 +178,8 @@ outbox = "outbox"
         self.assertEqual(tables[:3], ["T1", "T2", "T3"])
         self.assertEqual(tables.count("BIG"), 4)
         self.assertEqual(tables[-1], "B1")
-        self.assertEqual(self.subjects(), ["Phase finished: drop", "Phase finished: load",
-                                           "Phase finished: recreate", "Run finished: all done"])
+        self.assertEqual(self.subjects(), ["Phase finished: drop", "Schema finished: alpha", "Schema finished: beta",
+                                           "Phase finished: load", "Phase finished: recreate", "Run finished: all done"])
         for expected in ("load step 1 of 4: ALPHA/ora2pg_set_1.conf, 2 of 2 tables to do",
                          "ALPHA/ora2pg_set_1.conf: copying 2 table(s) with ora2pg (T1, T2)",
                          "ALPHA/ora2pg_set_1.conf: T1: oracle=10 postgres=10 equal",
@@ -319,6 +319,44 @@ outbox = "outbox"
         for line in chunk_file.read_text().splitlines():
             self.assertIn(f"BIG|{line}\n", calls)
 
+    def mail(self, subject):
+        for f in sorted((self.tmp / "outbox").glob("*.txt")):
+            text = f.read_text()
+            if text.startswith(f"Subject: [dataload] {subject}\n"):
+                return text
+        self.fail(f"no mail {subject!r} in {self.subjects()}")
+
+    def test_a_mail_when_each_schema_is_done_and_again_after_its_failures_are_fixed(self):
+        self.set_faults([{"match": "T2", "mode": "fatal", "times": 99}])
+        self.assertEqual(self.dataload("run"), 1, self.output)
+        self.assertIn("Schema finished: alpha (with failures)", self.subjects())
+        alpha = self.mail("Schema finished: alpha (with failures)")
+        self.assertIn("Schema: alpha", alpha)
+        self.assertIn("Load steps: 3", alpha)
+        self.assertIn("Tables and chunks: 6 of 7 done, 1 failed", alpha)
+        # T1 10 + T2 20 + T3 5 + BIG 100 on Oracle; the failed T2 copy left 10 of its 20 rows.
+        self.assertIn("Rows: Oracle 135, PostgreSQL 125 (4 tables counted)", alpha)
+        self.assertIn("Row counts that differ:\n- ALPHA.T2: oracle=20 postgres=10", alpha)
+        self.assertIn("ALPHA/ora2pg_set_1.conf :: T2", alpha)
+        self.assertIn("Whole run so far:", alpha)
+        beta = self.mail("Schema finished: beta")
+        self.assertIn("Tables and chunks: 1 of 1 done, 0 failed", beta)
+        self.assertIn("schema beta: all load steps ended", self.output)
+        self.set_faults([])
+        for f in (self.tmp / "outbox").glob("*.txt"):
+            f.unlink()
+        self.assertEqual(self.dataload("resume"), 0, self.output)
+        # Only alpha had something left to do, so only alpha is reported again, now complete.
+        self.assertEqual([s for s in self.subjects() if s.startswith("Schema")], ["Schema finished: alpha"])
+        self.assertIn("Tables and chunks: 7 of 7 done, 0 failed", self.mail("Schema finished: alpha"))
+
+    def test_schema_mails_can_be_turned_off(self):
+        toml = self.tmp / "dataload.toml"
+        toml.write_text(toml.read_text().replace("[email]\n", "[email]\nschema_finished = false\n"))
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assertNotIn("Schema finished: alpha", self.subjects())
+        self.assertIn("schema alpha: all load steps ended", self.output, "the log still says it")
+
     def test_resume_refuses_a_chunk_file_that_changed_since_the_run_started(self):
         self.set_faults([{"match": "ID BETWEEN 76 AND 9999", "mode": "fatal", "times": 99}])
         self.assertNotEqual(self.dataload("run"), 0, self.output)
@@ -445,7 +483,8 @@ outbox = "outbox"
         self.assertRegex(self.output, r"recreate\s+0 / 12\s+skipped by flag")
         self.assertIn("Flags     --skip-drop --skip-recreate", self.output)
         self.assertNotIn("drop/alpha", self.output, "skipped steps are not listed")
-        self.assertEqual(self.subjects(), ["Phase finished: load", "Run finished: all done"])
+        self.assertEqual(self.subjects(), ["Schema finished: alpha", "Schema finished: beta",
+                                           "Phase finished: load", "Run finished: all done"])
         outbox = sorted((self.tmp / "outbox").glob("*.txt"))[-1].read_text()
         self.assertIn("drop      skipped by flag", outbox)
 
@@ -493,8 +532,9 @@ outbox = "outbox"
         self.assertLess(out.index("rest: finished"), out.index("big: finished"), "the small steps waited for the chunks")
         self.assertLess(out.index("big: finished"), out.index("phase load finished"))
         self.assertLess(out.index("phase load finished"), out.index("recreate/"))
-        self.assertEqual(self.subjects(), ["Phase finished: drop", "Phase finished: load",
-                                           "Phase finished: recreate", "Run finished: all done"])
+        # beta is all in the "rest" lane; alpha is done only once the "big" lane has its chunks in too.
+        self.assertEqual(self.subjects(), ["Phase finished: drop", "Schema finished: beta", "Schema finished: alpha",
+                                           "Phase finished: load", "Phase finished: recreate", "Run finished: all done"])
         self.dataload("status")
         self.assertRegex(self.output, r"big\s+ALPHA/BIG/run_BIG\.sh\s+4 / 4\s+chunks\s+done")
         self.assertRegex(self.output, r"rest\s+BETA/ora2pg_set_1\.conf\s+1 / 1\s+tables\s+done")

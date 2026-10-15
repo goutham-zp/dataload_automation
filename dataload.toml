@@ -86,4 +86,5 @@ port = 587
 from = ""                      # a sender verified with the mail provider
 to = []                        # e.g. ["you@example.com"]
 subject_prefix = "[dataload]"
+schema_finished = true         # one mail when every load step of a schema has ended
 # outbox = "outbox"            # also write every mail to this folder as a text file

@@ -261,8 +261,9 @@ If `status` does not say the run is active and it is not finished, run `resume`.
 
 ## Emails
 
-One mail when a run resumes, one for each failed step, one at the end of each phase, and one at the finish with
-`report.html` attached. Row values quoted by database errors are shown as `***` in mails and in the report
+One mail when a run resumes, one for each failed step, one when every load step of a schema has ended (with
+its row counts and failures; `schema_finished = false` under `[email]` turns these off), one at the end of each
+phase, and one at the finish with `report.html` attached. Row values quoted by database errors are shown as `***` in mails and in the report
 (`hide_values`); the full text is in `logs/` and in `status --failed`.
 
 ## Files it writes
