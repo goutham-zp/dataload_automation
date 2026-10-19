@@ -2,13 +2,20 @@
 """Stand-in for the Oracle count helper, used only by the tests.
 
 Reads "id<TAB>sql" lines and answers from the same JSON file the fake ora2pg treats as Oracle,
-where rows are ids 1..n. FAKE_COUNT_FAIL names a table whose count must fail.
+where rows are ids 1..n (with AUDIT_DATE = 2024-01-01 00:00 + id * 7 hours, as the fake ora2pg writes it).
+FAKE_COUNT_FAIL names a table whose count must fail.
 """
 import json
 import os
 import re
 import sys
+from datetime import datetime, timedelta
 from pathlib import Path
+
+
+def audit_date(ID):
+    return f"{datetime(2024, 1, 1) + timedelta(hours=7 * ID):%Y-%m-%d %H:%M:%S}"
+
 
 source = json.loads(Path(os.environ["FAKE_ORA_SOURCE"]).read_text() or "{}")
 for line in sys.stdin:
@@ -29,6 +36,8 @@ for line in sys.stdin:
         continue
     if m.group(3):
         test = re.sub(r"ID BETWEEN (\d+) AND (\d+)", r"(\1 <= ID <= \2)", m.group(3))
-        test = re.sub(r"ID NOT IN \(([\d, ]+)\)", r"(ID not in (\1,))", test).replace(" OR ", " or ")
+        test = re.sub(r"ID NOT IN \(([\d, ]+)\)", r"(ID not in (\1,))", test)
+        test = re.sub(r"AUDIT_DATE >= DATE '([\d-]+)' AND AUDIT_DATE < DATE '([\d-]+)'",
+                      r"('\1' <= audit_date(ID) < '\2')", test).replace(" OR ", " or ")
         rows = sum(1 for ID in range(1, rows + 1) if eval(test))
     print(f"{ident}\t{rows}", flush=True)

@@ -9,6 +9,13 @@ number of chunks wanted, rounded up, so there are never more chunks than asked f
 Lines are written as the DBA's block and the old files have them, "ID BETWEEN low AND high": the first
 starts at the table's lowest ID, each next one at the previous end plus one (IDs must be whole numbers),
 and the last ends at the largest value the column can hold, so every row is in exactly one chunk.
+
+A DATE column is cut at whole days instead, from one count of rows per day: each chunk takes days until
+it holds at least N rows (one busy day can make a chunk larger). DATE values carry a time of day, so
+BETWEEN would leave out the last day's rows after midnight; these lines are half-open instead,
+"COL >= DATE 'first day' AND COL < DATE 'day after'", which Oracle and PostgreSQL both read the same way.
+The first starts at the earliest day, each next one where the previous stops, and the last stops at
+9999-12-31.
 The old chunk file is kept beside the new one as <name>.bak-<date>-<time>.
 """
 import argparse
@@ -32,6 +39,7 @@ from .state import State
 MAX_CHUNKS = 120        # the DBA's limit
 DEFAULT_CHUNKS = 100
 BIGINT_MAX = 2 ** 63 - 1  # last chunk's end when the column has no precision
+DATE_CEILING = "9999-12-31"  # last chunk's end for a DATE column (the line says "< DATE '9999-12-31'")
 
 # Reads "id<TAB>sql" lines and answers each with "id<TAB>ROW<TAB>value..." per row, then "id<TAB>END",
 # or "id<TAB>ERROR<TAB>why". One session serves every query of a table.
@@ -91,6 +99,26 @@ def conditions(column, lowest, highs, ceiling):
     starts = [lowest] + [high + 1 for high in highs[:-1]]
     ends = highs[:-1] + [ceiling]
     return [f"{column} BETWEEN {a} AND {b}" for a, b in zip(starts, ends)]
+
+
+def date_conditions(column, first_day, starts, ceiling=DATE_CEILING):
+    """Chunk conditions for a DATE column from the earliest day and the first day of every later chunk
+    (YYYY-MM-DD). Each chunk stops where the next starts, and the last stops at the ceiling."""
+    begins = [first_day] + list(starts)
+    ends = list(starts) + [ceiling]
+    return [f"{column} >= DATE '{a}' AND {column} < DATE '{b}'" for a, b in zip(begins, ends)]
+
+
+def day_starts(days, size):
+    """Where chunks begin after the first, from [(day, rows)] in day order: a chunk closes as soon as it
+    holds at least size rows, so there are never more than ceil(total / size) chunks."""
+    starts, held = [], 0
+    for day, rows in days:
+        if held >= size:
+            starts.append(day)
+            held = 0
+        held += rows
+    return starts
 
 
 def ceiling_for(precision):
@@ -260,8 +288,10 @@ class Chunker:
         data_type, nullable, index, num_rows, analyzed, precision, scale = (rows[0] + [""] * 7)[:7]
         t.info = {"type": data_type, "nullable": nullable, "index": index, "num_rows": num_rows,
                   "analyzed": analyzed, "precision": precision, "scale": scale}
-        if data_type not in ("NUMBER", "INTEGER"):
-            t.problems.append(f"{t.column} is {data_type}, not a whole number")
+        if data_type == "DATE":
+            pass
+        elif data_type not in ("NUMBER", "INTEGER"):
+            t.problems.append(f"{t.column} is {data_type}, neither a whole number nor a DATE")
         elif scale not in ("", "0"):
             t.problems.append(f"{t.column} is NUMBER({precision},{scale}) and can hold decimals; "
                               "BETWEEN chunks need whole numbers")
@@ -313,6 +343,43 @@ class Chunker:
         self.out(f"{t.label}: lowest {t.column} {low:,}, highest {high:,}; the last chunk ends at {ceiling}")
         return total, size, low, highs
 
+    def cut_by_day(self, t, ora, want, started):
+        """(rows, rows per chunk, chunk lines) for a DATE column, from one count of rows per day.
+        The query can be answered from the index alone, since the column leads it."""
+        self.out(f"{t.label}: counting rows per day of {t.column}")
+        hint = f'/*+ INDEX_FFS(x "{t.info["index"]}") */ ' if t.info.get("index") else ""
+        rows = ora.rows(f"""
+            SELECT {hint}TO_CHAR(TRUNC(x.{t.sql_column}), 'YYYY-MM-DD'), TO_CHAR(COUNT(1), 'TM9')
+            FROM {t.sql_name} x GROUP BY TRUNC(x.{t.sql_column}) ORDER BY 1""")
+        days = [(day, int(n)) for day, n in rows if day]
+        nulls = sum(int(n) for day, n in rows if not day)
+        total = sum(n for _, n in days) + nulls
+        if total == 0:
+            raise ChunkError("the table is empty")
+        if nulls:
+            raise ChunkError(f"{nulls:,} rows have no {t.column} and would be in no chunk")
+        first, last = days[0][0], days[-1][0]
+        if last >= DATE_CEILING:
+            raise ChunkError(f"latest {t.column} is {last}, on or after {DATE_CEILING} where the last chunk stops")
+        t.info.update(lowest=first, highest=last, ceiling=DATE_CEILING)
+        size = math.ceil(total / want)
+        starts = day_starts(days, size)
+        if len(starts) + 1 > MAX_CHUNKS:
+            raise ChunkError(f"more than {MAX_CHUNKS} chunks; nothing written")
+        lines = date_conditions(t.column, first, starts)
+        sizes, n = [], 0
+        bounds = set(starts)
+        for day, count in days:
+            if day in bounds:
+                sizes.append(n)
+                n = 0
+            n += count
+        sizes.append(n)
+        self.out(f"{t.label}: {total:,} rows over {len(days):,} days, {size:,} per chunk wanted, {len(lines)} chunks, "
+                 f"largest {max(sizes):,} rows ({human(time.time() - started)})")
+        self.out(f"{t.label}: earliest {t.column} {first}, latest {last}; the last chunk stops at {DATE_CEILING}")
+        return total, size, lines
+
     # ---------- writing ----------
 
     def write(self, t, lines, stamp):
@@ -342,6 +409,8 @@ class Chunker:
                      f"index {i['index'] or 'NONE'}, {rows}")
             if i["type"] in ("NUMBER", "INTEGER") and i["scale"] in ("", "0"):
                 self.out(f"  the last chunk will end at {ceiling_for(i['precision'])}")
+            elif i["type"] == "DATE":
+                self.out(f"  chunks are whole days, the last one stops at {DATE_CEILING}")
             if want and i["num_rows"].isdigit() and int(i["num_rows"]):
                 per = math.ceil(int(i["num_rows"]) / want)
                 self.out(f"  with --chunks {want}: about {per:,} rows per chunk")
@@ -407,12 +476,15 @@ class Chunker:
             started = time.time()
             ora = self.session(t)
             try:
-                total, size, low, highs = self.cut(t, ora, want, started)
+                if t.info.get("type") == "DATE":
+                    total, size, lines = self.cut_by_day(t, ora, want, started)
+                else:
+                    total, size, low, highs = self.cut(t, ora, want, started)
+                    lines = conditions(t.column, low, highs, t.info["ceiling"])
             finally:
                 ora.close()
             if self.stopping:
                 raise ChunkError("stopped")
-            lines = conditions(t.column, low, highs, t.info["ceiling"])
             backup = self.write(t, lines, stamp)
             self.out(f"{t.label}: {len(lines)} chunks written to {t.step.chunks_file}"
                      + (f", old file kept as {backup.name}" if backup else "") + f" ({human(time.time() - started)})")
@@ -463,7 +535,7 @@ def main(argv=None):
         p.add_argument("--table", action="append", default=[], metavar="NAME",
                        help="only this table (or step name, as 'plan' shows it); can be given more than once")
         p.add_argument("--column", action="append", default=[], metavar="TABLE=COLUMN",
-                       help="the ID column to cut a table by, when its chunk file does not say")
+                       help="the column to cut a table by (a whole-number ID or a DATE), when its chunk file does not say")
         p.add_argument("--chunks", type=int, default=DEFAULT_CHUNKS,
                        help=f"chunks wanted per table, at most {MAX_CHUNKS} (default {DEFAULT_CHUNKS})")
         if name == "make":

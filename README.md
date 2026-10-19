@@ -211,9 +211,17 @@ python3 -m dataload.chunks make --chunks 120 --table SAC_DATA --yes
   starts at the table's lowest ID, each next one at the previous end plus one, and the last ends at the
   largest value the column can hold (`9999999999` for a `NUMBER(10)`), so every row is in exactly one chunk.
   This needs whole-number IDs: a column that can hold decimals, and rows that have them, are refused.
+- **A DATE column** (a table with no usable numeric ID, such as `R_AUDIT_LOG` on `AUDIT_DATE`) is cut at whole
+  days, from one count of rows per day read from the index: a chunk takes days until it holds N rows, so one
+  busy day can make a chunk bigger. Lines are half-open, `AUDIT_DATE >= DATE '2024-01-01' AND AUDIT_DATE < DATE
+  '2024-03-15'`, because a DATE has a time of day and `BETWEEN` would miss the last day after midnight. The
+  first starts at the earliest day, each next one where the previous stops, and the last stops at
+  `9999-12-31`. Oracle and PostgreSQL read these lines the same way, which the load needs (it checks, clears
+  and counts each chunk on PostgreSQL too).
 - **The ID column** is the one the current chunk file uses, else the table's one-column primary key, else
   `--column TABLE=COLUMN`.
-- **It refuses** a table with rows that have no ID, IDs with decimals, an ID column no index starts with (every
+- **It refuses** a table with rows that have no ID, IDs with decimals, a column that is neither a whole number
+  nor a DATE, a DATE on or after 9999-12-31, an ID column no index starts with (every
   chunk would read the whole table), and anything while a run holds the lock. A table that fails keeps its old file; the
   others are still written.
 - `make` reads every ID of each table once, one Oracle session per table, all tables at the same time

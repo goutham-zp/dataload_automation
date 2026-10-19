@@ -2,6 +2,8 @@
 """Stand-in for ora2pg used only by the tests.
 
 "Oracle" is a JSON file (FAKE_ORA_SOURCE) of {"SCHEMA.TABLE": row_count}; rows are ids 1..n.
+A target table with an audit_date column also gets AUDIT_DATE = 2024-01-01 00:00 + id * 7 hours, so
+--where conditions on that date work as on Oracle (tests/fake/oracle_count counts the same way).
 Faults come from a JSON list (FAKE_ORA_FAULTS) of {"match", "mode", "times"} where match is a
 table name or part of a --where condition, and mode is transient | fatal | exit0 | hang | stubborn | falsefail | slow.
 """
@@ -84,6 +86,9 @@ def main():
     return status
 
 
+AUDIT_DATE = "TIMESTAMP '2024-01-01 00:00:00' + id * INTERVAL '7 hours'"
+
+
 def copy_tables(conf, opts, tables, source, schema, pg_schema):
     for t in tables:
         where = opts["--where"]
@@ -96,8 +101,11 @@ def copy_tables(conf, opts, tables, source, schema, pg_schema):
         rows = source.get(f"{schema}.{t}", 0)
         partial = " AND id % 2 = 0" if mode and mode not in ("falsefail", "slow") else ""
         if rows:
-            psql(conf, f"INSERT INTO {target} (id) SELECT id FROM generate_series(1, {rows}) "
-                       f"AS g(id) WHERE ({where or 'TRUE'}){partial}")
+            dated = psql(conf, f"SELECT count(*) FROM information_schema.columns WHERE table_schema = '{pg_schema}' "
+                               f"AND table_name = '{t.lower()}' AND column_name = 'audit_date'") == "1"
+            columns = "id, audit_date" if dated else "id"
+            psql(conf, f"INSERT INTO {target} ({columns}) SELECT {columns} FROM (SELECT id, {AUDIT_DATE} AS audit_date "
+                       f"FROM generate_series(1, {rows}) AS g(id)) s WHERE ({where or 'TRUE'}){partial}")
         if mode == "slow":        # a long copy that ends well, to see other lanes work meanwhile
             time.sleep(8)
         print(f"[========================>] rows (100.0%) Table {t}")

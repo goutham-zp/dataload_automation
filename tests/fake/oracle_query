@@ -4,7 +4,8 @@
 Answers the few queries chunks.py asks from FAKE_ORA_TABLES, a JSON object such as
 {"ALPHA.BIG": {"column": "ID", "ids": [1, 2, 5], "type": "NUMBER", "precision": 10, "scale": 0,
                "nullable": "N", "index": "BIG_PK", "pk": ["ID"], "num_rows": 3, "fail": "ORA-01555: snapshot too old"}}
-"precision" and "scale" default to none (a plain NUMBER).
+"precision" and "scale" default to none (a plain NUMBER). For a DATE column ("type": "DATE") the
+"ids" are "YYYY-MM-DD HH:MM:SS" texts, answered per day.
 "fail" makes the table's row reads fail. Every query is appended to FAKE_ORA_QUERY_LOG when it is set.
 """
 import json
@@ -54,6 +55,13 @@ for line in sys.stdin:
         print(f"{ident}\tERROR\t{t['fail']}", flush=True)
         continue
     ids = [x for x in t["ids"] if x is not None]
+    if "GROUP BY TRUNC(" in query:          # rows per day of a DATE column, NULLs last as Oracle sorts them
+        per_day = {}
+        for x in ids:
+            per_day[x[:10]] = per_day.get(x[:10], 0) + 1
+        nulls = len(t["ids"]) - len(ids)
+        answer(ident, [[day, n] for day, n in sorted(per_day.items())] + ([[None, nulls]] if nulls else []))
+        continue
     if "COUNT(1) - COUNT(" in query:
         fractions = sum(1 for x in ids if Decimal(str(x)) != Decimal(str(x)).to_integral_value())
         answer(ident, [[len(t["ids"]), len(t["ids"]) - len(ids), text(min(ids)) if ids else None,

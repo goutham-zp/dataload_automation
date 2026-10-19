@@ -16,6 +16,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +35,7 @@ CREATE TABLE alpha.t2 (id int CONSTRAINT t2_id_not_null NOT NULL, CONSTRAINT t2_
 CREATE TABLE alpha.t3 (id int CONSTRAINT t3_id_not_null NOT NULL, CONSTRAINT t3_pk PRIMARY KEY (id));
 CREATE TABLE alpha.big (id int CONSTRAINT big_id_not_null NOT NULL, CONSTRAINT big_pk PRIMARY KEY (id));
 CREATE INDEX t2_idx ON alpha.t2 USING btree (id);
+CREATE TABLE alpha.alog (id int, audit_date timestamp);
 CREATE TABLE beta.b1 (id int CONSTRAINT b1_id_not_null NOT NULL, t1_id int DEFAULT 1,
     CONSTRAINT b1_pk PRIMARY KEY (id), CONSTRAINT b1_t1_fk FOREIGN KEY (t1_id) REFERENCES alpha.t1(id));
 """
@@ -219,6 +221,17 @@ outbox = "outbox"
         self.assertRegex(self.output, r"ALPHA\.T3\s+5\s+3\s+5\s+5", "the before count is the one from before the load")
         self.assertEqual(self.dataload("report"), 0, self.output)
 
+    def test_before_counts_off_skips_the_snapshot_and_still_validates(self):
+        with open(self.tmp / "dataload.toml", "a") as f:
+            f.write("[validate]\nbefore_counts = false\n")
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assert_everything_loaded()
+        log = (self.tmp / "logs" / "dataload.log").read_text()
+        self.assertNotIn("before-load snapshot", log)
+        self.assertIn("BIG: oracle=100 postgres=100 equal", log)
+        self.assertIn("validation: 0 row-count mismatch(es)", log)
+        self.assertTrue((self.tmp / "report.html").exists())
+
     def test_a_failed_before_count_stops_the_run_before_anything_changes(self):
         self.env["FAKE_COUNT_FAIL"] = "T3"
         self.assertEqual(self.dataload("run"), 1, self.output)
@@ -318,6 +331,39 @@ outbox = "outbox"
         calls = self.calls.read_text()
         for line in chunk_file.read_text().splitlines():
             self.assertIn(f"BIG|{line}\n", calls)
+
+    def test_date_chunks_load_every_row_once_and_a_retried_day_range_leaves_no_duplicates(self):
+        # A table chunked on a DATE column, with lines as 'dataload.chunks make' writes them: half-open days.
+        from math import ceil
+        from dataload.chunks import date_conditions, day_starts
+        source = {**SOURCE, "ALPHA.ALOG": 100}
+        (self.tmp / "source.json").write_text(json.dumps(source))
+        folder = self.tmp / "content" / "ALPHA" / "ALOG"
+        folder.mkdir()
+        (folder / "ora2pg_ALOG.conf").write_text(conf_text("ALPHA"))
+        script = (self.tmp / "content" / "ALPHA" / "BIG" / "run_BIG.sh").read_text()
+        (folder / "run_ALOG.sh").write_text(script.replace("ora2pg_BIG.conf", "ora2pg_ALOG.conf")
+                                            .replace('TABLE_NAME="BIG"', 'TABLE_NAME="ALOG"'))
+        per_day = {}
+        for i in range(1, 101):   # the fake's AUDIT_DATE: 2024-01-01 + id * 7 hours
+            day = f"{datetime(2024, 1, 1) + timedelta(hours=7 * i):%Y-%m-%d}"
+            per_day[day] = per_day.get(day, 0) + 1
+        days = sorted(per_day.items())
+        lines = date_conditions("AUDIT_DATE", days[0][0], day_starts(days, ceil(100 / 4)))
+        self.assertEqual(len(lines), 4)
+        (folder / "chunks.txt").write_text("\n".join(lines) + "\n")
+        retried = lines[1].split("'")[1]          # the second chunk fails once after writing half its rows
+        self.set_faults([{"match": retried, "mode": "transient", "times": 1}])
+
+        self.assertEqual(self.dataload("run"), 0, self.output)
+        self.assertEqual(self.count("alpha.alog"), 100, "no row twice")
+        self.assertEqual(self.count("(SELECT DISTINCT id FROM alpha.alog) d"), 100)
+        self.assertEqual(self.count("alpha.alog WHERE audit_date IS NULL"), 0)
+        log = (self.tmp / "logs" / "dataload.log").read_text()
+        self.assertIn("run_ALOG.sh: ALOG: oracle=100 postgres=100 equal", log)
+        calls = self.calls.read_text()
+        for line in lines:
+            self.assertEqual(calls.count(f"ALOG|{line}\n"), 2 if retried in line.split(" AND ")[0] else 1, line)
 
     def mail(self, subject):
         for f in sorted((self.tmp / "outbox").glob("*.txt")):
