@@ -1,11 +1,13 @@
 """Set PostgreSQL's sequences from Oracle's after the data load.
 
-    python3 -m dataload.sequences [--config dataload.toml] plan | apply [--yes] | check
+    python3 -m dataload.sequences [--config dataload.toml] plan | apply [--yes] | check | undo CSV [--yes]
 
 Named sequences are matched by schema and name; identity columns by table and column, because their
 sequence names never match (ISEQ$$_645901 on Oracle, company_offer_company_offer_id_seq on PostgreSQL).
-Oracle's value is copied. A sequence already at or past it is left alone, so nothing ever moves back
-and running again is always safe. Sequences found on one side only are reported and not touched.
+Oracle's value is copied. A sequence only on PostgreSQL is set to the highest value in the columns it feeds
+plus one. A sequence already at or past its value is left alone, so apply never moves anything back and
+running again is always safe. Sequences only on Oracle are reported and not touched. undo puts the
+sequences an apply set back where they were, unless they were used since.
 """
 import argparse
 import csv
@@ -163,7 +165,13 @@ class Row:
     action: str = ""                # set | ahead | refused | oracle only | postgresql only | failed
     reason: str = ""
     moved: str = ""                 # Oracle's value when read again after apply, if it changed
+    data_highest: int = None        # postgresql only: highest value in the columns the sequence feeds
+    data_next: int = None           # postgresql only: the value it is set to, data_highest + increment
     target: PgSeq = field(default=None, repr=False)
+
+    @property
+    def goal(self):
+        return self.oracle_next if self.oracle_next is not None else self.data_next
 
 
 def quote_ident(name):
@@ -233,7 +241,7 @@ def match(oracle, pg, links, schema_map):
     for s in sorted(pg, key=lambda s: (s.schema, s.name)):
         if s.label not in matched:
             rows.append(Row("postgresql only", pg=s.label, pg_next=s.next_value, action="postgresql only",
-                            reason="left alone"))
+                            reason="left alone", target=s))
     return rows
 
 
@@ -250,6 +258,28 @@ def decide(row, o, target):
         row.action, row.reason = "refused", "this login may not change the sequence (UPDATE privilege)"
     else:
         row.action = "set"
+
+
+def decide_from_data(row, highest):
+    """A sequence only on PostgreSQL: the next value is the highest value in its columns plus one."""
+    seq = row.target
+    row.data_highest = highest
+    if highest is None:
+        row.reason = "its columns are empty; left alone"
+        return
+    if PLACEHOLDER_RE.match(str(highest)):
+        row.reason = f"highest value {highest} is an all-nines marker row; left alone, set it by hand if needed"
+        return
+    want = highest + seq.increment
+    if ahead(seq.next_value, want, seq.increment):
+        row.reason = f"already past its data (highest {highest}); left as it is"
+    elif not seq.min_value <= want <= seq.max_value:
+        row.action, row.reason = "refused", f"highest value + 1 is outside the range {seq.min_value}..{seq.max_value}"
+    elif not seq.can_update:
+        row.action, row.reason = "refused", "this login may not change the sequence (UPDATE privilege)"
+    else:
+        row.action, row.data_next = "set", want
+        row.reason = f"only on PostgreSQL: set from its data (highest {highest})"
 
 
 def read_links_file(path, schemas):
@@ -355,16 +385,29 @@ class Databases:
         schemas = ", ".join(quote_literal(s) for s in self.pg_schemas)
         return [Link(*r[:6], data_type=r[6]) for r in self.rows(PG_LINKS_SQL % {"schemas": schemas})]
 
-    def set_value(self, row):
-        """Moves the sequence to Oracle's value, or leaves it where it is if it got there first meanwhile."""
-        seq = row.target
+    @staticmethod
+    def current_next(seq):
         name = quote_ident(seq.schema) + "." + quote_ident(seq.name)
+        return name, f"(SELECT CASE WHEN is_called THEN last_value + {seq.increment} ELSE last_value END FROM {name})"
+
+    def set_value(self, row):
+        """Moves the sequence to its goal, or leaves it where it is if it got there first meanwhile."""
+        seq = row.target
+        name, current = self.current_next(seq)
         pick = "GREATEST" if seq.increment > 0 else "LEAST"
-        current = f"(SELECT CASE WHEN is_called THEN last_value + {seq.increment} ELSE last_value END FROM {name})"
-        rc, out, err = self.psql(f"SELECT setval({quote_literal(name)}, {pick}({row.oracle_next}, {current}), false)")
+        rc, out, err = self.psql(f"SELECT setval({quote_literal(name)}, {pick}({row.goal}, {current}), false)")
         if rc != 0:
             return None, err
         return int(out.strip()), ""
+
+    def restore_value(self, seq, after, before):
+        """Moves the sequence back to `before`, only if it still stands where the apply left it."""
+        name, current = self.current_next(seq)
+        rc, out, err = self.psql(f"SELECT CASE WHEN {current} = {after} "
+                                 f"THEN setval({quote_literal(name)}, {before}, false) END")
+        if rc != 0:
+            return None, err
+        return (int(out.strip()) if out.strip() else None), ""
 
     def column_extreme(self, link, increment, timeout_seconds):
         name = quote_ident(link.schema) + "." + quote_ident(link.table)
@@ -395,11 +438,50 @@ class Sync:
         if missing:
             raise SequenceError(f"Oracle returned owners not in the confs: {', '.join(missing)}")
         pg = self.db.pg_sequences()
-        rows = match(oracle, pg, self.db.pg_links(), self.db.schema_map)
+        links = self.db.pg_links()
+        rows = match(oracle, pg, links, self.db.schema_map)
         named = sum(1 for o in oracle if not o.identity and not o.name.startswith("ISEQ$$_"))
         self.out(f"Oracle {self.db.source}: {len(oracle)} sequences ({named} named, {len(oracle) - named} identity)")
         self.out(f"PostgreSQL {self.db.target}: {len(pg)} sequences in {len(self.db.pg_schemas)} schemas")
+        self.from_data([r for r in rows if r.kind == "postgresql only"], self.all_links(links))
         return oracle, rows
+
+    def all_links(self, links):
+        """The catalogue's links plus the links file's, each pair once."""
+        extra, problems = read_links_file(self.cfg.sequence_links, set(self.db.pg_schemas))
+        known = {(l.seq_label, l.column_label) for l in links}
+        return links + [l for l in extra if (l.seq_label, l.column_label) not in known], problems
+
+    def from_data(self, rows, links_and_problems):
+        """Sequences only on PostgreSQL: the highest value in the columns each one feeds decides its value."""
+        links, _ = links_and_problems
+        types = {l.column_label: l.data_type for l in links if l.data_type}
+        fed = {}
+        for link in links:
+            fed.setdefault(link.seq_label, []).append(link)
+
+        def one(row):
+            columns = [l for l in fed.get(row.pg, []) if types.get(l.column_label, "") in NUMERIC_TYPES | {""}]
+            if not columns:
+                row.reason = "no number column is linked to it; left alone"
+                return
+            values = []
+            for link in columns:
+                value, err = self.db.column_extreme(link, row.target.increment, self.cfg.sequence_check_timeout)
+                if err:
+                    row.reason = f"highest value of {link.column_label} not read ({err}); left alone"
+                    return
+                if value is not None:
+                    try:
+                        values.append(int(value))
+                    except ValueError:
+                        row.reason = f"{link.column_label} does not hold whole numbers; left alone"
+                        return
+            pick = max if row.target.increment > 0 else min
+            decide_from_data(row, pick(values) if values else None)
+
+        with ThreadPoolExecutor(max_workers=max(1, self.cfg.count_workers)) as pool:
+            list(pool.map(one, rows))
 
     def summary(self, rows, verb):
         names = {"set": verb, "ahead": "already level or past Oracle", "refused": "refused",
@@ -409,6 +491,9 @@ class Sync:
             count = sum(1 for r in rows if r.action == action)
             if count:
                 self.out(f"  {label:32} {count:5}")
+            from_data = sum(1 for r in rows if r.action == action and r.kind == "postgresql only")
+            if action in ("set", "failed") and from_data:
+                self.out(f"    {'of which only on PostgreSQL':30} {from_data:5}")
         for action in ("refused", "failed", "oracle only"):
             listed = [r for r in rows if r.action == action]
             if listed:
@@ -424,10 +509,11 @@ class Sync:
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["kind", "oracle_sequence", "identity_column", "postgresql_sequence", "oracle_next_value",
-                        "postgresql_next_before", "postgresql_next_after", "action", "reason", "oracle_value_moved_to"])
+                        "postgresql_next_before", "postgresql_next_after", "action", "reason", "oracle_value_moved_to",
+                        "column_highest", "postgresql_target"])
             for r in rows:
                 w.writerow([r.kind, r.oracle, r.feeds, r.pg, r.oracle_next, r.pg_next, r.pg_after, r.action, r.reason,
-                            r.moved])
+                            r.moved, r.data_highest, self.db.target])
         return path
 
     def plan(self):
@@ -453,14 +539,8 @@ class Sync:
         if not todo:
             self.out("\nNothing to set.")
         else:
-            if not yes:
-                if not sys.stdin.isatty():
-                    self.out("\nnot asking without a terminal; pass --yes to set them")
-                    return 2
-                answer = confirm(f"\nSet {len(todo)} sequences on {self.db.target}? Type yes to go on: ")
-                if answer.strip().lower() != "yes":
-                    self.out("nothing was changed")
-                    return 2
+            if not self.agreed(yes, confirm, f"Set {len(todo)} sequences on {self.db.target}?"):
+                return 2
             with ThreadPoolExecutor(max_workers=max(1, self.cfg.count_workers)) as pool:
                 results = list(pool.map(self.db.set_value, todo))
             for row, (value, err) in zip(todo, results):
@@ -468,8 +548,8 @@ class Sync:
                     row.action, row.reason = "failed", err
                 else:
                     row.pg_after = value
-                    if value != row.oracle_next:
-                        row.reason = "PostgreSQL got past Oracle's value meanwhile; left there"
+                    if value != row.goal:
+                        row.reason = "PostgreSQL got past this value meanwhile; left there"
             done = sum(1 for r in todo if r.action == "set")
             self.out(f"\n{done} of {len(todo)} sequences set.")
         moved = self.oracle_moved(oracle, rows)
@@ -479,6 +559,85 @@ class Sync:
         self.out(f"Details: {self.write_csv(rows, 'apply')}")
         checked = self.check()
         return 1 if failed or moved or checked else 0
+
+    def agreed(self, yes, confirm, question):
+        if yes:
+            return True
+        if not sys.stdin.isatty():
+            self.out("\nnot asking without a terminal; pass --yes to go on")
+            return False
+        if confirm(f"\n{question} Type yes to go on: ").strip().lower() != "yes":
+            self.out("nothing was changed")
+            return False
+        return True
+
+    def undo(self, path, yes=False, confirm=input):
+        """Puts back the values an apply's CSV recorded, for each sequence that still stands where apply left it."""
+        problem = self.target_problem(changing=True)
+        if problem:
+            self.out(problem)
+            return 2
+        try:
+            with open(path, newline="") as f:
+                recorded = list(csv.DictReader(f))
+        except OSError as e:
+            self.out(f"cannot read {path}: {e.strerror}")
+            return 2
+        needed = {"postgresql_sequence", "postgresql_next_before", "postgresql_next_after", "action"}
+        if not recorded or not needed <= set(recorded[0]):
+            self.out(f"{path} is not a CSV written by 'dataload.sequences apply'")
+            return 2
+        targets = {r.get("postgresql_target") for r in recorded} - {None, ""}
+        if targets and targets != {self.db.target}:
+            self.out(f"{path} was written for {', '.join(sorted(targets))}, not {self.db.target}; nothing was done")
+            return 2
+        sequences = {s.label: s for s in self.db.pg_sequences()}
+        todo, results = [], []
+        for r in recorded:
+            if r["action"] != "set" or not r["postgresql_next_after"] or not r["postgresql_next_before"]:
+                continue
+            label, after, before = r["postgresql_sequence"], int(r["postgresql_next_after"]), int(r["postgresql_next_before"])
+            seq = sequences.get(label)
+            if seq is None:
+                results.append([label, "", before, "", "skipped", "sequence not found on PostgreSQL"])
+            elif seq.next_value != after:
+                results.append([label, seq.next_value, before, "", "skipped",
+                                f"used or moved since the apply (next was {after}, is now {seq.next_value}); "
+                                "moving it back could hand out numbers already used"])
+            else:
+                todo.append((label, seq, after, before))
+        if not todo and not results:
+            self.out(f"{path} records no sequence that apply set; nothing to undo")
+            return 0
+        self.out(f"{len(todo)} sequences to put back on {self.db.target}, {len(results)} skipped")
+        for label, _, after, before in todo[:20]:
+            self.out(f"  {label}: {after} -> {before}")
+        if len(todo) > 20:
+            self.out(f"  ... and {len(todo) - 20} more")
+        if todo and not self.agreed(yes, confirm, f"Put {len(todo)} sequences back?"):
+            return 2
+        with ThreadPoolExecutor(max_workers=max(1, self.cfg.count_workers)) as pool:
+            done = list(pool.map(lambda t: self.db.restore_value(t[1], t[2], t[3]), todo))
+        for (label, _, after, before), (value, err) in zip(todo, done):
+            if err:
+                results.append([label, after, before, "", "failed", err])
+            elif value is None:
+                results.append([label, after, before, "", "skipped", "used or moved meanwhile; left as it is"])
+            else:
+                results.append([label, after, before, value, "restored", ""])
+        self.cfg.logs.mkdir(parents=True, exist_ok=True)
+        out = self.cfg.logs / f"sequences-undo-{self.stamp}.csv"
+        with open(out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["postgresql_sequence", "next_before_undo", "next_wanted", "next_after_undo", "result", "reason"])
+            w.writerows(sorted(results))
+        restored = sum(1 for r in results if r[4] == "restored")
+        self.out(f"\n{restored} of {len(todo)} sequences put back.")
+        for r in sorted(results):
+            if r[4] != "restored":
+                self.out(f"  {r[4].upper()} {r[0]}: {r[5]}")
+        self.out(f"Details: {out}")
+        return 0 if restored == len(results) else 1
 
     def oracle_moved(self, before, rows):
         """Reads Oracle again: a value that moved means Oracle is still being written to."""
@@ -503,12 +662,8 @@ class Sync:
         if problem.startswith("confs point"):
             self.out(problem)
             return 2
-        schemas = set(self.db.pg_schemas)
         sequences = {s.label: s for s in self.db.pg_sequences()}
-        extra, problems = read_links_file(self.cfg.sequence_links, schemas)
-        links = self.db.pg_links()
-        known = {(l.seq_label, l.column_label) for l in links}
-        links += [l for l in extra if (l.seq_label, l.column_label) not in known]
+        links, problems = self.all_links(self.db.pg_links())
         types = {l.column_label: l.data_type for l in links if l.data_type}
         results = []
 
@@ -573,6 +728,9 @@ def main(argv=None):
     apply = sub.add_parser("apply", help="set the sequences that are behind Oracle, then run the check")
     apply.add_argument("--yes", action="store_true", help="do not ask before changing anything")
     sub.add_parser("check", help="compare each sequence with the highest value in the columns it feeds")
+    undo = sub.add_parser("undo", help="put back the sequences an apply set, from its logs/sequences-apply-*.csv")
+    undo.add_argument("csv", help="the CSV the apply wrote")
+    undo.add_argument("--yes", action="store_true", help="do not ask before changing anything")
     args = parser.parse_args(argv)
 
     try:
@@ -592,6 +750,8 @@ def main(argv=None):
             return sync.plan()
         if args.command == "apply":
             return sync.apply(yes=args.yes)
+        if args.command == "undo":
+            return sync.undo(args.csv, yes=args.yes)
         return sync.check()
     except (SequenceError, plan.PlanError) as e:
         print(f"error: {e}")
