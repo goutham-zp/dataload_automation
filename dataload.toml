@@ -51,26 +51,25 @@ ignore = []
 # 'plan' and 'preflight' refuse a layout with an unknown name, a step in two lanes, a step in no lane,
 # or one table loaded in two lanes. Drop, recreate and validation are not affected and run as before.
 enabled = false
-# Longest first, each large step in its own lane, the small steps together in lane5.
-# Three chunk scripts can run at once (lanes 2, 3 and 4): about PARALLEL_JOBS x 3 PostgreSQL connections each,
+# Longest first, each large step in its own lane. lane5 runs the small steps, which end early, and then the
+# smaller chunk scripts, which would otherwise wait behind A_EDI_DATA and EMAIL (steps after "*" run after it).
+# Up to four chunk scripts can run at once (lanes 2-5): about PARALLEL_JOBS x 3 PostgreSQL connections each,
 # so max_connections must be raised above 300 before using this layout.
 lane1 = ["FTS/ora2pg_set_5.conf"]
-lane2 = [
-    "FTS/A_EDI_DATA/run_A_EDI_DATA_1.sh",
-    "FTS/SAC_DATA/run_SAC_DATA.sh",
-    "FTS/A_EDI_SUMMASY/run_A_EDI_SUMMARY.sh",
-]
+lane2 = ["FTS/A_EDI_DATA/run_A_EDI_DATA_1.sh"]
 lane3 = [
     "FTS/R_AUDIT_LOG/run_R_AUDIT_LOG.sh",
     "FTS/ora2pg_set_4.conf",
     "FTS/ora2pg_set_6.conf",
 ]
-lane4 = [
-    "FAST/EMAIL_TO_SEND_ARCHIVE_1/run_EMAIL_TO_SEND_ARCHIVE.sh",
+lane4 = ["FAST/EMAIL_TO_SEND_ARCHIVE_1/run_EMAIL_TO_SEND_ARCHIVE.sh"]
+lane5 = [
+    "FTS/ora2pg_set_7.conf", "FAST/ora2pg_set_1.conf", "FTS/ora2pg_set_8.conf",
+    "FAST_TRACK/ora2pg_fast_track_set.conf", "SECADMIN/ora2pg_set_1.conf", "*",
+    "FTS/SAC_DATA/run_SAC_DATA.sh",
+    "FTS/A_EDI_SUMMASY/run_A_EDI_SUMMARY.sh",
     "FTS/A_EFT_PROCESSED/run_A_EFT_PROCESSED.sh",
 ]
-lane5 = ["FTS/ora2pg_set_7.conf", "FAST/ora2pg_set_1.conf", "FTS/ora2pg_set_8.conf",
-         "FAST_TRACK/ora2pg_fast_track_set.conf", "SECADMIN/ora2pg_set_1.conf", "*"]
 
 [sequences]
 # For 'python3 -m dataload.sequences check'. Extra sequence -> column links the PostgreSQL catalogue cannot see.

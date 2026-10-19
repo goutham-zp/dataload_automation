@@ -309,7 +309,7 @@ class AgreedLanes(unittest.TestCase):
         lanes, problems, warnings = plan.lanes(cfg, plan.load_steps(cfg))
         self.assertEqual(problems, [])
         self.assertEqual(len(warnings), 1)
-        self.assertIn("chunk scripts are in 3 lanes (lane2, lane3, lane4)", warnings[0])
+        self.assertIn("chunk scripts are in 4 lanes (lane2, lane3, lane4, lane5)", warnings[0])
         self.assertEqual([name for name, _ in lanes], ["lane1", "lane2", "lane3", "lane4", "lane5"])
         self.assertEqual([s.id for s in lanes[0][1]], ["FTS/ora2pg_set_5.conf"])
         self.assertTrue(all(s.kind == "chunk" for s in lanes[1][1]))
