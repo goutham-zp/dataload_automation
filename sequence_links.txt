@@ -8,7 +8,7 @@ fast.approved_old_invoice_audit_detail_seq  fts.approved_old_invoice_audit_detai
 fast.dw_report_definition_id_seq            fast.dw_report_definition.dw_report_definition_id              # application ORM mapping
 fast.elmah$error_seq                        fast.elmah$error.sequencenumber                                # Oracle trigger
 fast.inv_recon_data_file_type_seq           fast.invoice_recon_data_file_type.inv_recon_data_file_type_id  # application ORM mapping
-fast.invoice_match_seq                      fast.invoice_match.invoice_match_id                            # application ORM mapping
+fast.match_method_seq                       fast.invoice_match.invoice_match_id                            # dev: sequence sits at highest ID + 1
 fast.po_inv_type_retailer_id_seq            fast.po_invoice_type_retailer.po_invoice_type_retailer_id      # application ORM mapping
 fast_track.distributor_rep_divisions_seq    fast_track.distributor_rep_divisions.dist_rep_division_id      # application ORM mapping
 fast_track.elmah$error_seq                  fast_track.elmah$error.sequencenumber                          # Oracle trigger
@@ -52,7 +52,6 @@ fts.sac_data_seq                            fts.sac_data_hold.fts_sac_id        
 fts.sales_projection_adjst_seq              fts.sales_projection_adjst.sales_adjustment_seq                # Oracle trigger
 fts.store_bill_history_seq                  fts.a_store_billing_history.store_bill_history_seq             # Oracle trigger
 fts.www_errors_seq                          fts.www_errors.www_errors_id                                   # Oracle trigger
-fts.www_login_seq                           fts.www_login.www_login                                        # Oracle trigger
 fts.www_login_store_id_seq                  fts.www_login_store.www_login_store_id                         # application ORM mapping
 fts.x_van_transmission_seq                  fts.x_van_transmission.x_van_transmission_seq                  # Oracle trigger
 pricesource.daily_successful_map_id_seq     pricesource.daily_successful_map.daily_successful_map_id       # Oracle package

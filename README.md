@@ -161,8 +161,9 @@ Total connections are the sum over every step running at the same moment. Check 
 ## Sequences after the load
 
 A data load copies rows with their IDs, so it never moves a sequence. `dataload.sequences` sets every
-PostgreSQL sequence to Oracle's value (one only on PostgreSQL from its own data). It is a separate command, not a
-phase: run it once Oracle writes have stopped, after the load.
+PostgreSQL sequence to Oracle's value, or past its own data when that is further, and lists everything it would not
+decide on its own for a person, with the reason and a suggested fix. It is a separate command, not a phase: run it
+once Oracle writes have stopped, after the load, and again after any reload.
 
 ```
 python3 -m dataload.sequences plan          # dry run: what would change and why; changes nothing
@@ -178,12 +179,23 @@ python3 -m dataload.sequences undo logs/sequences-apply-<time>.csv   # puts back
 - **Value.** Oracle's `LAST_NUMBER`, so the next insert gets exactly that number. A sequence already at or past
   it is left alone: apply never moves anything back (for a descending sequence, "back" is up). Running again is safe and
   only moves what fell behind.
+- **Past its data.** Every sequence is also compared with the highest value in the columns it feeds (identity, OWNED BY,
+  column default, `sequence_links.txt`; all-nines marker rows are stepped over). When rows already hold numbers it
+  would hand out (Oracle inserts some IDs by hand), it is raised to that highest value plus one, but only when those
+  rows look like its own run: they start in the lower half of the range above it and fill at least 1 in 100 of its
+  numbers. A sparse or far block (reserved IDs, a few typed in by hand) is listed for a person instead, with how soon
+  the sequence runs into it.
 - **Refused, with the reason in the output:** Oracle's value outside the PostgreSQL sequence's range (an `integer`
   sequence), a different increment, a PostgreSQL sequence two Oracle sequences point at, no UPDATE privilege.
 - **Only on Oracle:** listed, never created.
-- **Only on PostgreSQL:** set to the highest value in the columns it feeds plus one (identity, OWNED BY, column
-  default, `sequence_links.txt`), never moved back. Left alone, with the reason in the CSV, when no number column is
-  linked, the columns are empty, or the highest value is an all-nines marker row. Never dropped.
+- **Only on PostgreSQL:** set from its data by the same rule, never moved back. Left alone when its columns are empty;
+  listed for a person when no column is linked or its columns hold all-nines marker rows. Never dropped.
+- **Needs a person.** `plan`, `apply` and `check` end with one list, most urgent first: failed, refused, rows already
+  taken, a sparse block above the sequence, marker rows, a column not read in time or not a number, a
+  `sequence_links.txt` line naming a missing sequence, a column linked to more than one sequence, a sequence only on
+  PostgreSQL that nothing links to a column, only on Oracle, and schemas on the target that no conf names (never read
+  or set). Each has the reason and a suggested fix, often the exact SQL. All of them are in
+  `logs/sequences-manual-*.csv`; the screen shows up to 25 of each kind.
 - **Undo.** `undo` reads an apply's CSV and moves each sequence that apply set back to its value before. A sequence
   used or moved since the apply is skipped, because moving it back could hand out numbers already used. It refuses a
   CSV written for another database, asks before changing anything (`--yes` without a terminal), and writes
@@ -192,11 +204,13 @@ python3 -m dataload.sequences undo logs/sequences-apply-<time>.csv   # puts back
   exit code is 1; run `apply` again once writes have stopped.
 - **Check.** Every column fed by a sequence (identity, OWNED BY, column default, plus `sequence_links.txt` for
   links PostgreSQL cannot see: Oracle triggers, packages, the application's ORM) against that sequence's next
-  value. `placeholder` means an all-nines marker row, the same as on Oracle. `needs a look` means a row already
-  holds a value the sequence will hand out. The check changes nothing.
+  value. `placeholder` means all-nines marker rows above the real rows, the same as on Oracle. `needs a look` means a
+  row already holds a value the sequence will hand out. The check changes nothing.
 - **Output.** A summary on screen and CSV files in `logs/` (`sequences-plan-*.csv`, `sequences-apply-*.csv`,
-  `sequences-check-*.csv`, `sequences-undo-*.csv`). No row data is printed, only sequence numbers and IDs.
-- **Exit code.** 0 clean, 1 something to look at (a failure, Oracle moved, check findings, or a sequence undo skipped), 2 did not run.
+  `sequences-check-*.csv`, `sequences-manual-*.csv`, `sequences-undo-*.csv`). No row data is printed, only sequence
+  numbers and IDs.
+- **Exit code.** 0 clean, 1 something to look at (a failure, Oracle moved, check findings, anything on the
+  needs-a-person list, or a sequence undo skipped), 2 did not run. `plan` exits 0 whatever it lists.
   It refuses to run when the confs point somewhere other than `[target] expected`, and `apply` refuses when that
   is not set.
 
