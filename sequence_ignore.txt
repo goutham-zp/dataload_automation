@@ -1,0 +1,34 @@
+# Items "python3 -m dataload.sequences" lists for a person that are known to need nothing. They are left off the
+# list on screen and do not make the exit code 1; the CSV still has them, with the reason, under ignored_because.
+# Format: pattern [problem]  # reason   (pattern: schema.sequence or schema.table.column, * matches anything;
+# schema.* for a schema no conf names; problem: as the list names it, e.g. far ahead). A line without a reason is
+# not used. Without a problem an entry hides every problem of what it matches, so name one where you can.
+# Source: UAT review, 20 Oct 2026 (sequences-to-fix-uat-2026-10-20.xlsx, "Leave" rows).
+
+flyway_m.*                                  # Flyway's own schema history; not migrated from Oracle
+demo.*                                      # not migrated from Oracle; another application's schema
+dxp_experience.*                            # not migrated from Oracle; another application's schema
+public.*                                    # not migrated from Oracle
+
+fts.iseq$$_*                                # Oracle identity sequence names copied to PostgreSQL; the identity columns use their own *_seq, nothing calls these
+fast.manual_etfs_history_history_id_seq     # stray: manual_etfs_history uses manual_etfs_history_history_id_seq1
+fast.bank_seq                               # stray: bank IDs come from ft.bank_seq
+fast.iseq$$_656538                          # Oracle identity of fast.company_live_date_import_file_old, a backup table nothing inserts into
+
+fast.auth0_dummy_email_seq                  # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fast.fms_dummy_email_seq                    # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fast.fms_user_invite_id_seq                 # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fast.a_return_data_history_history_id_seq   # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fast.example_table_id_seq                   # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fts.company_offer_id_seq                    # application counter, no column; only on PostgreSQL, so no Oracle value to match
+fts.customer_id_seq                         # application counter, no column; only on PostgreSQL, so no Oracle value to match
+
+# Prod plan review, 1 Nov 2026: reviewed, nothing to do.
+fts.r_company_seq  rows above the sequence    # reserved IDs 10000001-10000010 (also on UAT); the sequence follows Oracle and is 9.6M inserts away
+fast.email_to_send_seq  far ahead             # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+fts.r_comp_pri_ovr_hist_id_seq  far ahead     # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+fts.r_company_maps_hist_id_seq  far ahead     # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+fts.store_bill_history_seq  far ahead         # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+new_billing.billing_info_id_seq  far ahead    # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+new_billing.other_billing_data_id_seq  far ahead    # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered
+new_billing.relationship_billing_id_seq  far ahead  # pushed ahead of Oracle by an earlier setval; no rows in the gap, harmless, not lowered

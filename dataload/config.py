@@ -54,6 +54,10 @@ class Config:
     oracle_query: str = ""                      # tests only: stands in for the Perl helper chunks.py writes
     sequence_links: Path = None                 # extra sequence -> column links for 'dataload.sequences check'
     sequence_check_timeout: float = 120         # seconds one column's max() may take in that check
+    sequence_ignore: Path = None                # known items left off the needs-a-person list, each with a reason
+    sequence_raise: Path = None                 # sequences apply may raise past rows above them, each with a reason
+    sequence_auto_raise_max_jump: int = 1000    # a sequence this few numbers behind its data is raised on its own
+    sequence_ahead_warn_gap: int = 1000000      # a sequence this many numbers past where it should be is listed
 
 
 def load_env_file(path):
@@ -115,4 +119,8 @@ def load(path):
         oracle_query=tools.get("oracle_query", ""),
         sequence_links=(root / sequences.get("links", "sequence_links.txt")).resolve(),
         sequence_check_timeout=float(sequences.get("check_timeout_seconds", 120)),
+        sequence_ignore=(root / sequences.get("ignore", "sequence_ignore.txt")).resolve(),
+        sequence_raise=(root / sequences.get("raise", "sequence_raise.txt")).resolve(),
+        sequence_auto_raise_max_jump=int(sequences.get("auto_raise_max_jump", 1000)),
+        sequence_ahead_warn_gap=int(sequences.get("ahead_warn_gap", 1000000)),
     )

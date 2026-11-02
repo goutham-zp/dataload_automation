@@ -9,8 +9,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dataload.sequences import (Link, OracleSeq, PgSeq, Row, check_label, decide_from_data, link_problems, match,
-                                own_run, read_links_file)
+from dataload.sequences import (Link, Manual, OracleSeq, PgSeq, Row, SequenceError, check_label, decide_from_data,
+                                ignored_by, link_problems, match, oracle_from_url, own_run, pg_from_url,
+                                read_ignore_file, read_links_file, shared_default_groups)
 
 ROOT = Path(__file__).resolve().parents[1]
 PGBIN = Path(os.environ.get("DATALOAD_TEST_PGBIN", "/opt/homebrew/opt/postgresql@18/bin"))
@@ -179,6 +180,32 @@ class OwnRun(unittest.TestCase):
         self.assertFalse(own_run(-21, -9000, 1, -9000, -1))
 
 
+class Urls(unittest.TestCase):
+    def test_postgresql_url(self):
+        env, target = pg_from_url("postgresql://loader:p%40ss%3Aw%2Fd@pg-host:5900/ftxe01")
+        self.assertEqual(env, {"PGHOST": "pg-host", "PGPORT": "5900", "PGDATABASE": "ftxe01", "PGUSER": "loader",
+                               "PGPASSWORD": "p@ss:w/d"})
+        self.assertEqual(target, "pg-host:5900/ftxe01")
+        env, target = pg_from_url("postgres://loader@pg-host/ftxe01")
+        self.assertEqual((env["PGPORT"], env["PGPASSWORD"], target), ("5432", "", "pg-host:5432/ftxe01"))
+
+    def test_oracle_url(self):
+        env, source = oracle_from_url("oracle://loader:p%40ss@ora-host:1522/FTXUAT")
+        self.assertEqual(env, {"DL_ORA_DSN": "dbi:Oracle:host=ora-host;SERVICE_NAME=FTXUAT;port=1522",
+                               "DL_ORA_USER": "loader", "DL_ORA_PWD": "p@ss"})
+        self.assertEqual(source, "host=ora-host;SERVICE_NAME=FTXUAT;port=1522")
+        self.assertEqual(oracle_from_url("oracle://u:p@ora-host/S")[0]["DL_ORA_DSN"],
+                         "dbi:Oracle:host=ora-host;SERVICE_NAME=S;port=1521")
+
+    def test_bad_url_is_refused_without_showing_the_password(self):
+        for parse, url in ((pg_from_url, "mysql://u:secret1@h/db"), (pg_from_url, "postgresql://u:secret1@h/"),
+                           (pg_from_url, "postgresql://u:secret1@/db"), (oracle_from_url, "oracle://u:secret1@h"),
+                           (oracle_from_url, "oracle://u:secret1@h:port/S"), (oracle_from_url, "oracle://h:1521/S")):
+            with self.assertRaises(SequenceError, msg=url) as caught:
+                parse(url)
+            self.assertNotIn("secret1", str(caught.exception))
+
+
 class CheckRules(unittest.TestCase):
     def test_labels(self):
         self.assertEqual(check_label(None, 5, 1)[0], "ok")
@@ -201,14 +228,47 @@ class CheckRules(unittest.TestCase):
 
     def test_link_problems(self):
         links = [Link("seqa", "t", "id", "seqa", "t_id_seq", "identity"),
-                 Link("seqa", "t", "id", "seqa", "t_id_seq", "owned by"),
-                 Link("seqa", "u", "id", "seqa", "u_seq", "default"),
-                 Link("seqa", "u", "id", "seqa", "other_seq", "links file"),
                  Link("seqa", "v", "id", "seqa", "gone_seq", "links file")]
-        items = link_problems(links, {"seqa.t_id_seq", "seqa.u_seq", "seqa.other_seq"})
-        self.assertEqual([(m.problem, m.sequence, m.column) for m in items], [
-            ("sequence not found", "seqa.gone_seq", "seqa.v.id"),
-            ("more than one sequence", "seqa.other_seq, seqa.u_seq", "seqa.u.id")])
+        items = link_problems(links, {"seqa.t_id_seq"})
+        self.assertEqual([(m.problem, m.sequence, m.column) for m in items],
+                         [("sequence not found", "seqa.gone_seq", "seqa.v.id")])
+
+    def test_one_sequence_as_the_default_of_two_columns_of_a_table(self):
+        links = [Link("seqa", "rev", "id", "seqa", "rev_seq", "default"),
+                 Link("seqa", "rev", "fts_id", "seqa", "rev_seq", "default"),
+                 Link("seqa", "rev", "id", "seqa", "rev_seq", "owned by"),
+                 Link("seqa", "other", "id", "seqa", "rev_seq", "default"),
+                 Link("seqa", "solo", "id", "seqa", "solo_seq", "default")]
+        groups = shared_default_groups(links)
+        self.assertEqual(list(groups), [("seqa.rev_seq", "seqa.rev")])
+        self.assertEqual(sorted(l.column for l in groups[("seqa.rev_seq", "seqa.rev")]), ["fts_id", "id"])
+
+    def test_ignore_file_needs_a_reason_for_every_line(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ignore.txt"
+            path.write_text("# comment\nflyway_m.*  # Flyway's own\nfts.iseq$$_*  # leftovers\nfast.bank_seq\n")
+            patterns, problems = read_ignore_file(path)
+        self.assertEqual(patterns, [("flyway_m.*", "", "Flyway's own"), ("fts.iseq$$_*", "", "leftovers")])
+        self.assertEqual(problems, ["ignore.txt line 4: no reason after #, so it is not used"])
+        schema = Manual("1 sequence", "flyway_m", "schema not in the confs", "", "")
+        leftover = Manual("fts.iseq$$_633070", "", "no column linked", "", "")
+        stray = Manual("fast.bank_seq", "", "no column linked", "", "")
+        self.assertEqual(ignored_by(schema, patterns), "Flyway's own")
+        self.assertEqual(ignored_by(leftover, patterns), "leftovers")
+        self.assertEqual(ignored_by(stray, patterns), "")
+        self.assertEqual(read_ignore_file(Path("/nonexistent")), ([], []))
+
+    def test_ignore_line_can_name_the_one_problem_it_covers(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "ignore.txt"
+            path.write_text("fast.email_to_send_seq  far ahead  # gap left by an earlier setval\n")
+            patterns, problems = read_ignore_file(path)
+        self.assertEqual((patterns, problems), ([("fast.email_to_send_seq", "far ahead", "gap left by an earlier setval")],
+                                                []))
+        ahead_item = Manual("fast.email_to_send_seq", "", "far ahead", "", "")
+        collision = Manual("fast.email_to_send_seq", "fast.email_to_send.id", "needs a look", "", "")
+        self.assertEqual(ignored_by(ahead_item, patterns), "gap left by an earlier setval")
+        self.assertEqual(ignored_by(collision, patterns), "")          # a new problem still shows
 
 
 def sql(statement):
@@ -251,9 +311,30 @@ CREATE SEQUENCE seqb.bank_seq;
 CREATE TABLE seqb.bank (bank_id int DEFAULT nextval('seqb.bank_seq'));
 INSERT INTO seqb.bank VALUES (5), (6621);
 CREATE TABLE seqb.second (x bigint);
-INSERT INTO seqb.second VALUES (70);
+INSERT INTO seqb.second VALUES (5000);
+CREATE SEQUENCE seqa.rev_seq;
+CREATE TABLE seqa.reversal (silver_bullet_id bigint PRIMARY KEY DEFAULT nextval('seqa.rev_seq'),
+                            fts_id bigint DEFAULT nextval('seqa.rev_seq'));
+INSERT INTO seqa.reversal VALUES (1, 7238), (2, 339993);
+CREATE SEQUENCE seqb.filter_seq;
+CREATE TABLE seqb.r_filter (filter_id bigint PRIMARY KEY DEFAULT nextval('seqb.filter_seq'));
+INSERT INTO seqb.r_filter SELECT generate_series(1, 10) UNION ALL SELECT 28;
+CREATE SEQUENCE seqb.ref_seq;
+CREATE TABLE seqb.ledger (id bigint PRIMARY KEY, ref_id bigint DEFAULT nextval('seqb.ref_seq'));
+INSERT INTO seqb.ledger VALUES (1, 500), (2, 900);
+CREATE SEQUENCE seqb.ftype_seq START 5;
+CREATE SEQUENCE seqb.wrong_seq START 22;
+CREATE TABLE seqb.ftype (ftype_id bigint DEFAULT nextval('seqb.wrong_seq'));
+INSERT INTO seqb.ftype VALUES (1), (2), (3);
 CREATE TABLE seqb.own (own_id bigint GENERATED BY DEFAULT AS IDENTITY, note text);
 INSERT INTO seqb.own (own_id) VALUES (3), (40);
+CREATE SEQUENCE seqa.company_seq START 10000050;
+CREATE TABLE seqa.company (fts_id bigint PRIMARY KEY DEFAULT nextval('seqa.company_seq'));
+INSERT INTO seqa.company SELECT generate_series(1, 40) UNION ALL SELECT generate_series(10000000, 10000014);
+CREATE SEQUENCE seqa.dist_seq START 3;
+CREATE TABLE seqa.dist (fts_id bigint PRIMARY KEY DEFAULT nextval('seqa.dist_seq') REFERENCES seqa.company,
+                        silver_bullet_id bigint DEFAULT nextval('seqa.dist_seq'));
+INSERT INTO seqa.dist VALUES (1, 1), (40, 2);
 """
 ORACLE = [
     ["SEQA", "ORDER_SEQ", "51", "1", None, None],
@@ -266,6 +347,10 @@ ORACLE = [
     ["SEQB", "TOK_SEQ", "11", "1", None, None],
     ["SEQB", "BANK_SEQ", "1585", "1", None, None],
     ["SEQA", "TASK_SEQ", "7", "1", None, None],
+    ["SEQA", "REV_SEQ", "3", "1", None, None],
+    ["SEQB", "FILTER_SEQ", "20", "1", None, None],
+    ["SEQA", "COMPANY_SEQ", "36", "1", None, None],
+    ["SEQA", "DIST_SEQ", "3", "1", None, None],
 ]
 
 
@@ -286,23 +371,24 @@ class EndToEnd(unittest.TestCase):
         for schema in SCHEMAS:
             (self.tmp / "content" / schema).mkdir(parents=True)
             (self.tmp / "content" / schema / "ora2pg_set_1.conf").write_text(conf_text(schema))
-        (self.tmp / "sequence_links.txt").write_text("seqa.order_seq seqb.second.x\n")
+        (self.tmp / "sequence_links.txt").write_text("seqa.order_seq seqb.second.x\nseqb.ftype_seq seqb.ftype.ftype_id\n")
+        (self.tmp / "sequence_ignore.txt").write_text("seqc.*  # not migrated from Oracle\nseqa.pg_only_seq\n")
         self.oracle = self.tmp / "oracle.json"
         self.oracle.write_text(json.dumps(ORACLE))
         self.write_settings(f"localhost:{PGPORT}/{DB}")
         self.env = {**os.environ, "PYTHONPATH": str(ROOT), "FAKE_ORA_SEQUENCES": str(self.oracle),
                     "FAKE_ORA_SEQUENCES_LATER": str(self.tmp / "oracle_later.json")}
 
-    def write_settings(self, expected):
+    def write_settings(self, expected, extra="", psql=PSQL):
         (self.tmp / "dataload.toml").write_text(f"""
 [paths]
 content = "content"
 [tools]
-psql = "{PSQL}"
+psql = "{psql}"
 oracle_rows = "{ROOT / 'tests' / 'fake' / 'oracle_rows'}"
 [target]
 expected = "{expected}"
-""")
+{extra}""")
 
     def sequences(self, *args):
         r = subprocess.run([sys.executable, "-m", "dataload.sequences", "--config", str(self.tmp / "dataload.toml"),
@@ -318,15 +404,16 @@ expected = "{expected}"
         return {name: self.next_value(name) for name in (
             "seqa.order_seq", "seqa.ahead_seq", "seqa.hist_history_id_seq", "seqa.small_seq", "seqa.down_seq",
             "seqa.pg_only_seq", "seqb.tok_seq", "seqb.bank_seq", "seqb.own_own_id_seq", "seqa.task_seq",
-            "seqb.mark_mark_id_seq")}
+            "seqb.mark_mark_id_seq", "seqa.rev_seq", "seqb.filter_seq", "seqb.ref_seq", "seqb.ftype_seq",
+            "seqb.wrong_seq", "seqa.company_seq")}
 
     def test_plan_changes_nothing(self):
         before = self.values()
         self.assertEqual(self.sequences("plan"), 0, self.output)
         self.assertEqual(self.values(), before)
-        for expected in ("10 sequences (8 named, 2 identity)", "would be set", "only on Oracle (2):",
+        for expected in ("14 sequences (12 named, 2 identity)", "would be set", "only on Oracle (2):",
                          "refused (1):\n    seqa.small_seq\n        why: Oracle's value is outside PostgreSQL's range",
-                         "fix: ALTER SEQUENCE seqa.small_seq AS bigint", "Nothing was changed"):
+                         "fix: ALTER SEQUENCE seqa.small_seq AS bigint", "far ahead (1):", "Nothing was changed"):
             self.assertIn(expected, self.output)
         self.assertTrue(list((self.tmp / "logs").glob("sequences-manual-*.csv")))
         csv_files = list((self.tmp / "logs").glob("sequences-plan-*.csv"))
@@ -347,26 +434,52 @@ expected = "{expected}"
         self.assertEqual(self.values(), {
             "seqa.order_seq": 51, "seqa.ahead_seq": 500, "seqa.hist_history_id_seq": 30, "seqa.small_seq": 1,
             "seqa.down_seq": -21, "seqa.pg_only_seq": 1, "seqb.tok_seq": 11, "seqb.bank_seq": 1585,
-            "seqb.own_own_id_seq": 41, "seqa.task_seq": 15, "seqb.mark_mark_id_seq": 1})
-        self.assertIn("7 of 7 sequences set", self.output)
+            "seqb.own_own_id_seq": 41, "seqa.task_seq": 15, "seqb.mark_mark_id_seq": 1, "seqa.rev_seq": 3,
+            "seqb.filter_seq": 29, "seqb.ref_seq": 1, "seqb.ftype_seq": 5, "seqb.wrong_seq": 22,
+            "seqa.company_seq": 10000050})
+        self.assertIn("9 of 9 sequences set", self.output)
         self.assertRegex(self.output, r"of which only on PostgreSQL\s+1")
-        self.assertRegex(self.output, r"of which past Oracle \(data\)\s+1")
+        self.assertRegex(self.output, r"of which past Oracle \(data\)\s+2")      # task_seq; filter_seq, a 9-number jump
         self.assertRegex(self.output, r"placeholder\s+1")
         self.assertNotIn("WARNING", self.output)
         for expected in (
                 "seqb.bank_seq  ->  seqb.bank.bank_id\n        why: one value, 6621, is at or past its next value 1585",
-                "it runs into 6621 after 5036 more inserts",
+                "it runs into 6621 after 5036 more inserts; if the column is meant to be unique that insert fails",
                 "fix: if those IDs are the sequence's own: SELECT setval('seqb.bank_seq', 6622, false);",
                 "seqa.order_seq  ->  seqb.second.x",
                 "marker rows (1):\n    seqb.mark_mark_id_seq  ->  seqb.mark.mark_id",
                 "SELECT setval('seqb.mark_mark_id_seq', 3, false);",
                 "no column linked (1):\n    seqa.pg_only_seq",
-                "schema not in the confs (1):\n    1 sequence  ->  seqc",
-                "Needs a person: 8"):
+                # one sequence as the default of the key and of a foreign key: only the latter is wrong
+                "seqa.rev_seq  ->  seqa.reversal.fts_id, seqa.reversal.silver_bullet_id",
+                "its next value is 3; fts_id highest 339993; silver_bullet_id highest 2 (key). Probably wrong on fts_id",
+                "fix: ALTER TABLE seqa.reversal ALTER COLUMN fts_id DROP DEFAULT;",
+                # the key is also a foreign key: its values come from the table it points at, so it is the wrong one
+                "seqa.dist_seq  ->  seqa.dist.fts_id, seqa.dist.silver_bullet_id",
+                "fts_id highest 40 (key); silver_bullet_id highest 2. Probably wrong on fts_id: a foreign key to "
+                "seqa.company, so its values come from there",
+                "fix: ALTER TABLE seqa.dist ALTER COLUMN fts_id DROP DEFAULT;",
+                # a column that is not a key: no insert fails, the default is suspect
+                "seqb.ref_seq  ->  seqb.ledger.ref_id\n        why: its values reach 900",
+                "fix: ALTER TABLE seqb.ledger ALTER COLUMN ref_id DROP DEFAULT;",
+                # two sequences on one column: the one just above the highest value
+                "seqb.wrong_seq (default) next 22; the column's highest value is 3; closest above it: seqb.ftype_seq",
+                "ALTER TABLE seqb.ftype ALTER COLUMN ftype_id SET DEFAULT nextval('seqb.ftype_seq');",
+                # left far ahead by an earlier setval: listed, never lowered; its own rows go up to 40
+                "far ahead (1):\n    seqa.company_seq  ->  seqa.company.fts_id\n        why: its next value 10000050 is "
+                "10000009 numbers past where it should be, 41 (Oracle's value 36; seqa.company.fts_id holds its own "
+                "rows up to 40); 15 values from 10000000 to 10000014 sit in between",
+                "fix: a lowering, for the DBA and only if the team wants it: SELECT setval('seqa.company_seq', 41, "
+                "false); it then runs into 10000000 after 9999959 inserts",
+                "warning: sequence_ignore.txt line 2: no reason after #, so it is not used",
+                "Needs a person: 12, each with the reason and a suggested fix (1 known item left off"):
             self.assertIn(expected, self.output)
+        self.assertNotIn("schema not in the confs", self.output)
         manual = list((self.tmp / "logs").glob("sequences-manual-*.csv"))
         self.assertEqual(len(manual), 1)
-        self.assertEqual(len(manual[0].read_text().splitlines()), 9)
+        text = manual[0].read_text()
+        self.assertEqual(len(text.splitlines()), 14)
+        self.assertIn("not migrated from Oracle", text)
         sql("SELECT nextval('seqa.order_seq')")
         self.assertEqual(self.sequences("apply", "--yes"), 1, self.output)
         self.assertIn("Nothing to set", self.output)
@@ -390,6 +503,79 @@ expected = "{expected}"
         self.assertIn("dataload.toml expects elsewhere:5432/other", self.output)
         self.assertEqual(self.values(), before)
 
+    def test_connections_from_env_file_win_over_the_confs(self):
+        for schema in SCHEMAS:      # confs that point nowhere: only .env can make this work
+            path = self.tmp / "content" / schema / "ora2pg_set_1.conf"
+            path.write_text(path.read_text().replace(f"port={PGPORT}", "port=1"))
+        (self.tmp / ".env").write_text(f"ORACLE_URL=oracle://seq%40reader:s3cret%23x@ora-host:1522/FTXUAT\n"
+                                       f"PG_URL=postgresql://{os.environ.get('USER')}:unused@localhost:{PGPORT}/{DB}\n")
+        seen = self.tmp / "seen.json"
+        self.env["FAKE_ORA_SEEN"] = str(seen)
+        self.assertEqual(self.sequences("plan"), 0, self.output)
+        self.assertEqual(json.loads(seen.read_text()), ["dbi:Oracle:host=ora-host;SERVICE_NAME=FTXUAT;port=1522",
+                                                        "seq@reader", "s3cret#x"])
+        self.assertIn("Oracle host=ora-host;SERVICE_NAME=FTXUAT;port=1522 (ORACLE_URL in .env): 14 sequences",
+                      self.output)
+        self.assertIn(f"PostgreSQL localhost:{PGPORT}/{DB} (PG_URL in .env; the confs point at localhost:1/{DB})",
+                      self.output)
+        self.assertNotIn("s3cret", self.output)
+        self.assertNotIn("unused", self.output)
+        self.write_settings(f"localhost:1/{DB}")       # what the confs say: PG_URL wins, so it is refused
+        self.assertEqual(self.sequences("plan"), 2, self.output)
+        self.assertIn(f"PG_URL in .env points at localhost:{PGPORT}/{DB} but dataload.toml expects localhost:1/{DB}",
+                      self.output)
+
+    def behind_pgbouncer(self, fail_on=""):
+        self.write_settings(f"localhost:{PGPORT}/{DB}", psql=ROOT / "tests" / "fake" / "psql_bouncer")
+        self.env.update(REAL_PSQL=PSQL, FAKE_PSQL_FAIL_ON=fail_on)
+
+    def test_reads_columns_through_pgbouncer(self):
+        self.behind_pgbouncer()
+        self.assertEqual(self.sequences("plan"), 0, self.output)
+        self.assertNotIn("unsupported startup parameter", self.output)
+        self.assertNotIn("column not read", self.output)
+        self.assertIn("seqa.company.fts_id holds its own rows up to 40", self.output)    # the data was read
+
+    def test_unread_columns_suggest_no_lowering_and_no_wrong_default(self):
+        self.behind_pgbouncer(fail_on='"fts_id"')       # seqa.company.fts_id and seqa.reversal.fts_id
+        self.assertEqual(self.sequences("plan"), 0, self.output)
+        self.assertIn("column not read", self.output)
+        self.assertIn("seqa.company_seq  ->  seqa.company.fts_id", self.output)
+        self.assertNotIn("far ahead", self.output)
+        self.assertIn("fts_id highest not read; silver_bullet_id highest 2 (key). Not judged: fts_id could not be read",
+                      self.output)
+        self.assertNotIn("ALTER TABLE seqa.reversal ALTER COLUMN fts_id DROP DEFAULT", self.output)
+
+    def test_a_tie_between_two_sequences_names_neither(self):
+        sql("ALTER SEQUENCE seqb.ftype_seq RESTART 22")             # now level with seqb.wrong_seq
+        self.sequences("plan")
+        self.assertIn("seqb.ftype_seq and seqb.wrong_seq are equally close (next 22): the values cannot tell which "
+                      "one is used", self.output)
+        self.assertIn("fix: find which one the application calls (nextval in its code or a trigger) and make that one "
+                      "the column default", self.output)
+        self.assertNotIn("closest above it", self.output)
+
+    def test_sequence_raise_file_lets_apply_go_past_a_known_block(self):
+        (self.tmp / "sequence_raise.txt").write_text("seqb.bank_seq  # 6621 was typed in by hand; skip past it\n"
+                                                     "seqa.order_seq\n")
+        self.assertEqual(self.sequences("apply", "--yes"), 1, self.output)
+        self.assertEqual(self.next_value("seqb.bank_seq"), 6622)
+        self.assertEqual(self.next_value("seqa.order_seq"), 51)        # its line has no reason: not used
+        self.assertIn("warning: sequence_raise.txt line 2: no reason after #, so it is not used", self.output)
+        self.assertNotIn("seqb.bank_seq  ->  seqb.bank.bank_id", self.output)
+        self.assertIn("as sequence_raise.txt says (6621 was typed in by hand; skip past it)",
+                      sorted((self.tmp / "logs").glob("sequences-apply-*.csv"))[-1].read_text())
+
+    def test_far_ahead_only_past_ahead_warn_gap(self):
+        self.write_settings(f"localhost:{PGPORT}/{DB}", "[sequences]\nahead_warn_gap = 20000000\n")
+        self.assertEqual(self.sequences("plan"), 0, self.output)
+        self.assertNotIn("far ahead", self.output)
+        self.write_settings(f"localhost:{PGPORT}/{DB}", "[sequences]\nahead_warn_gap = 300\n")
+        self.sequences("plan")
+        self.assertIn("far ahead (2):", self.output)
+        self.assertIn("seqa.ahead_seq\n        why: its next value 500 is 400 numbers past where it should be, 100 "
+                      "(Oracle's value 100); nothing collides", self.output)
+
     def apply_csv(self):
         return str(sorted((self.tmp / "logs").glob("sequences-apply-*.csv"))[-1])
 
@@ -400,7 +586,7 @@ expected = "{expected}"
         self.assertEqual(self.sequences("undo", self.apply_csv()), 2, self.output)
         self.assertIn("pass --yes", self.output)
         self.assertEqual(self.sequences("undo", self.apply_csv(), "--yes"), 1, self.output)
-        self.assertIn("6 of 6 sequences put back", self.output)
+        self.assertIn("8 of 8 sequences put back", self.output)
         self.assertIn("SKIPPED seqa.order_seq: used or moved since the apply (next was 51, is now 52)", self.output)
         expected = dict(before, **{"seqa.order_seq": 52})
         self.assertEqual(self.values(), expected)
@@ -419,8 +605,8 @@ expected = "{expected}"
         self.assertEqual(self.sequences("check"), 1, self.output)
         self.assertIn("seqa.order_seq  ->  seqa.orders.order_id\n        why: rows from 1 to 50 already hold numbers",
                       self.output)
-        self.assertIn("fix: run apply, which raises it, or SELECT setval('seqa.order_seq', 51, false);", self.output)
-        self.assertIn("schema not in the confs (1)", self.output)
+        self.assertIn("fix: SELECT setval('seqa.order_seq', 51, false); (apply does this on its own)", self.output)
+        self.assertIn("(1 known item left off, as sequence_ignore.txt says)", self.output)
         self.assertTrue(list((self.tmp / "logs").glob("sequences-check-*.csv")))
 
 

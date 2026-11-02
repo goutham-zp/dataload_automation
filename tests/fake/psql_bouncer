@@ -1,0 +1,17 @@
+#!/bin/bash
+# Stand-in for psql behind PgBouncer, used only by the tests. It refuses statement_timeout as a startup option the
+# way PgBouncer does, and fails any statement containing $FAKE_PSQL_FAIL_ON, like a column that cannot be read.
+# Everything else goes to the real psql in $REAL_PSQL.
+if [[ "$PGOPTIONS" == *statement_timeout* ]]; then
+    echo "psql: error: connection to server failed: FATAL:  unsupported startup parameter in options: statement_timeout" >&2
+    exit 2
+fi
+if [[ -n "$FAKE_PSQL_FAIL_ON" ]]; then
+    for arg in "$@"; do
+        if [[ "$arg" == *"$FAKE_PSQL_FAIL_ON"* ]]; then
+            echo "ERROR:  canceling statement due to statement timeout" >&2
+            exit 1
+        fi
+    done
+fi
+exec "$REAL_PSQL" "$@"

@@ -18,5 +18,8 @@ source = Path(os.environ["FAKE_ORA_SEQUENCES"])
 later = Path(os.environ.get("FAKE_ORA_SEQUENCES_LATER", "/nonexistent"))
 if number > 1 and later.exists():
     source = later
+if os.environ.get("FAKE_ORA_SEEN"):         # what it was asked to connect with, for the tests to compare
+    Path(os.environ["FAKE_ORA_SEEN"]).write_text(json.dumps([os.environ.get(k) for k in (
+        "DL_ORA_DSN", "DL_ORA_USER", "DL_ORA_PWD")]))
 for row in json.loads(source.read_text()):
     print("\t".join(["ROW"] + ["" if v is None else str(v) for v in row]))

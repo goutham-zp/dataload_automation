@@ -1,0 +1,6 @@
+# Sequences "python3 -m dataload.sequences apply" may raise past rows above them that do not look like its own run
+# (a block typed in by hand), which it otherwise leaves to a person. Format: pattern  # reason (pattern:
+# schema.sequence, * matches anything). A line without a reason is not used. Raising only skips numbers.
+# Source: prod plan review, 1 Nov 2026.
+
+ft.bank_seq                     # bank ID 6621 was typed in by hand on Oracle; inserts would fail on it after ~5,000 more, so skip past it (as done on UAT)

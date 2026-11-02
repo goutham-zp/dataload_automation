@@ -173,6 +173,13 @@ python3 -m dataload.sequences check         # compares each sequence with the hi
 python3 -m dataload.sequences undo logs/sequences-apply-<time>.csv   # puts back what that apply set
 ```
 
+- **Connections.** From `ORACLE_URL` and `PG_URL` in `.env` when they are set (format in `.env.example`:
+  `oracle://user:password@host:1521/service`, `postgresql://user:password@host:5432/dbname`, special characters in
+  the user or password percent-encoded), otherwise from the confs. The confs still name the schemas. The first two
+  lines of the output say which was used, and where the confs point when `.env` overrides them; `[target] expected`
+  is checked against the one used. Only `dataload.sequences` reads these two; the load always uses the confs.
+  It works through PgBouncer: the time limit on each column read (`check_timeout_seconds`) is set with
+  `SET LOCAL` inside the query, not as a connection option.
 - **Matching.** Named sequences are matched by schema and name. Identity columns are matched by table and column,
   because their names never match (`ISEQ$$_647701` on Oracle, `segment_rule_history_history_id_seq` here).
   Schemas are the `SCHEMA` / `PG_SCHEMA` pairs in the confs; connections come from the confs too.
@@ -183,19 +190,45 @@ python3 -m dataload.sequences undo logs/sequences-apply-<time>.csv   # puts back
   column default, `sequence_links.txt`; all-nines marker rows are stepped over). When rows already hold numbers it
   would hand out (Oracle inserts some IDs by hand), it is raised to that highest value plus one, but only when those
   rows look like its own run: they start in the lower half of the range above it and fill at least 1 in 100 of its
-  numbers. A sparse or far block (reserved IDs, a few typed in by hand) is listed for a person instead, with how soon
-  the sequence runs into it.
+  numbers, or the jump is at most `auto_raise_max_jump` numbers (1000 by default, under `[sequences]`; 0 turns it off),
+  since skipping that few costs nothing. A sparse or far block (reserved IDs, a few typed in by hand) is listed for a
+  person instead, with how soon the sequence runs into it and whether that insert fails: it does on a primary key or
+  unique column, and the output says when the table has no key yet to tell.
+- **Wrong column.** Data never raises a sequence from a column that cannot be its own: one that is not a key while
+  its table has keys, or one of two or more columns of a table whose default calls the same sequence (the one that
+  is not the key, or whose values the sequence cannot have produced). That is usually a foreign key with a copied
+  default; it is listed as `default on the wrong column?` with the `ALTER TABLE ... DROP DEFAULT` to run. Of two such
+  columns, one that is a single-column foreign key is the wrong one, even when it is also the primary key (one row
+  per parent: its values are the parent's IDs). After a load with `--skip-constraints` there are no foreign keys yet,
+  and the primary key and the values decide. A column that could not be read stops the guess.
+- **Far ahead.** Apply never lowers a sequence, so one an earlier setval or a reload by `TRUNCATE` over a used
+  database left far up stays there: nothing collides, but new IDs go far up, maybe in among reserved IDs. A matched
+  sequence more than `ahead_warn_gap` numbers (1,000,000 by default, under `[sequences]`; 0 turns it off) past where
+  it should be is listed as `far ahead`. Where it should be is Oracle's value, or past the rows that follow on from
+  it with no gap of more than `auto_raise_max_jump` numbers. The list names the block in between, if any, and gives
+  the `setval` that lowers it, with how many inserts until it reaches that block. It is never lowered on its own.
 - **Refused, with the reason in the output:** Oracle's value outside the PostgreSQL sequence's range (an `integer`
   sequence), a different increment, a PostgreSQL sequence two Oracle sequences point at, no UPDATE privilege.
 - **Only on Oracle:** listed, never created.
 - **Only on PostgreSQL:** set from its data by the same rule, never moved back. Left alone when its columns are empty;
   listed for a person when no column is linked or its columns hold all-nines marker rows. Never dropped.
 - **Needs a person.** `plan`, `apply` and `check` end with one list, most urgent first: failed, refused, rows already
-  taken, a sparse block above the sequence, marker rows, a column not read in time or not a number, a
-  `sequence_links.txt` line naming a missing sequence, a column linked to more than one sequence, a sequence only on
-  PostgreSQL that nothing links to a column, only on Oracle, and schemas on the target that no conf names (never read
-  or set). Each has the reason and a suggested fix, often the exact SQL. All of them are in
-  `logs/sequences-manual-*.csv`; the screen shows up to 25 of each kind.
+  taken, a sparse block above the sequence, marker rows, a sequence far ahead, a column not read in time or not a number, a
+  `sequence_links.txt` line naming a missing sequence, a column linked to more than one sequence (with each one's next
+  value against the column's highest, and the closest one above it suggested), a sequence only on PostgreSQL that
+  nothing links to a column, only on Oracle, and schemas on the target that no conf names (never read or set). Each
+  has the reason and a suggested fix, often the exact SQL. All of them are in `logs/sequences-manual-*.csv`; the
+  screen shows up to 25 of each kind.
+- **Known items.** `sequence_ignore.txt` lists what was reviewed and needs nothing (other applications' schemas,
+  leftover sequences, application counters, gaps left by an earlier setval), one `pattern [problem]  # reason` per
+  line, e.g. `fast.email_to_send_seq  far ahead  # ...`. Those are left off the screen and the exit code, and kept in
+  the CSV with the reason under `ignored_because`. A line without a reason is reported and not used. Without a
+  problem an entry hides every problem of what it matches, a later collision too, so name the problem where you can.
+- **Known blocks.** `sequence_raise.txt` (same format, sequences only) lists sequences whose rows above are known to
+  be safe to skip, such as one ID typed in by hand: apply raises them past those rows instead of listing them, and
+  the reason goes into the apply CSV. Raising only skips numbers.
+- **Two sequences on one column.** When their next values are equally close to the column's highest value, the list
+  says the values cannot tell which one is used, and suggests nothing beyond finding the one the application calls.
 - **Undo.** `undo` reads an apply's CSV and moves each sequence that apply set back to its value before. A sequence
   used or moved since the apply is skipped, because moving it back could hand out numbers already used. It refuses a
   CSV written for another database, asks before changing anything (`--yes` without a terminal), and writes

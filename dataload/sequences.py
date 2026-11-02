@@ -4,7 +4,8 @@
 
 Named sequences are matched by schema and name; identity columns by table and column, because their
 sequence names never match (ISEQ$$_645901 on Oracle, company_offer_company_offer_id_seq on PostgreSQL).
-Oracle's value is copied, or the highest value in the columns a sequence feeds plus one when that is further and
+Connections come from ORACLE_URL and PG_URL in .env when set, otherwise from the confs; the confs always name the
+schemas. Oracle's value is copied, or the highest value in the columns a sequence feeds plus one when that is further and
 those rows look like its own run; a sequence only on PostgreSQL goes by its data alone. A sequence already at or
 past its value is left alone, so apply never moves anything back and running again is always safe. Whatever it
 will not decide on its own is listed for a person with the reason and a suggested fix (logs/sequences-manual-*.csv).
@@ -12,6 +13,7 @@ undo puts the sequences an apply set back where they were, unless they were used
 """
 import argparse
 import csv
+import fnmatch
 import os
 import re
 import subprocess
@@ -19,6 +21,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
+from urllib.parse import unquote, urlsplit
 
 from . import config, plan
 from .conf import OraConf
@@ -96,12 +99,36 @@ GROUP BY n.nspname
 ORDER BY n.nspname
 """
 
+# Primary keys and unique indexes: a column that is one on its own can never hold a value twice, so a sequence
+# behind its data breaks inserts there. A key's first column is enough to know the table has keys at all.
+PG_KEYS_SQL = """
+SELECT n.nspname, t.relname, CASE WHEN i.indnkeyatts = 1 THEN coalesce(a.attname, '') ELSE '' END
+FROM pg_index i
+JOIN pg_class t ON t.oid = i.indrelid AND NOT t.relispartition
+JOIN pg_namespace n ON n.oid = t.relnamespace
+LEFT JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = i.indkey[0]
+WHERE (i.indisprimary OR i.indisunique) AND i.indpred IS NULL AND n.nspname IN (%s)
+"""
+
+# Single-column foreign keys: such a column holds the IDs of the table it points at, never its own sequence's.
+PG_FOREIGN_KEYS_SQL = """
+SELECT n.nspname, t.relname, a.attname, rn.nspname, r.relname
+FROM pg_constraint k
+JOIN pg_class t ON t.oid = k.conrelid
+JOIN pg_namespace n ON n.oid = t.relnamespace
+JOIN pg_attribute a ON a.attrelid = k.conrelid AND a.attnum = k.conkey[1]
+JOIN pg_class r ON r.oid = k.confrelid
+JOIN pg_namespace rn ON rn.oid = r.relnamespace
+WHERE k.contype = 'f' AND cardinality(k.conkey) = 1 AND n.nspname IN (%s)
+"""
+
 NUMERIC_TYPES = {"smallint", "integer", "bigint", "numeric"}
 PLACEHOLDER_RE = re.compile(r"^-?9{5,}\d?$")   # 999999, 999999999, 9999999991: marker rows typed in by hand
 SEP = "\x1f"                                     # psql field separator; never part of a name
 
 # The manual list, most urgent first; at most this many of each kind on screen, all of them in the CSV.
-MANUAL_ORDER = ["failed", "refused", "needs a look", "rows above the sequence", "marker rows", "outside the range",
+MANUAL_ORDER = ["failed", "refused", "needs a look", "default on the wrong column?", "rows above the sequence",
+                "marker rows", "outside the range", "far ahead",
                 "column not read", "not a number column", "not whole numbers", "sequence not found",
                 "more than one sequence", "no column linked", "only on Oracle", "schema not in the confs"]
 MANUAL_SHOWN = 25
@@ -204,6 +231,13 @@ class Manual:
     reason: str
     fix: str
 
+    @property
+    def names(self):
+        """What sequence_ignore.txt patterns are matched against: its sequences and columns, or schema.* """
+        if self.problem == "schema not in the confs":
+            return [f"{self.column}.*"]
+        return [n.strip() for n in self.sequence.split(",") + self.column.split(",") if n.strip()]
+
 
 def quote_ident(name):
     return '"' + name.replace('"', '""') + '"'
@@ -211,6 +245,36 @@ def quote_ident(name):
 
 def quote_literal(text):
     return "'" + text.replace("'", "''") + "'"
+
+
+def split_url(url, schemes, default_port, what):
+    """(host, port, user, password, path) of a connection URL. Errors never quote it: it holds the password."""
+    try:
+        parts = urlsplit(url)
+        port = parts.port or default_port
+    except ValueError:
+        raise SequenceError(f"{what} in .env is not a valid URL") from None
+    if parts.scheme not in schemes:
+        raise SequenceError(f"{what} in .env must start with {schemes[0]}://")
+    path = unquote(parts.path.lstrip("/"))
+    if not parts.hostname or not parts.username or not path:
+        raise SequenceError(f"{what} in .env needs a user, a host and a {'database' if what == 'PG_URL' else 'service'}"
+                            f" name: {schemes[0]}://user:password@host:{default_port}/name")
+    return parts.hostname, port, unquote(parts.username), unquote(parts.password or ""), path
+
+
+def pg_from_url(url):
+    """postgresql://user:password@host:port/dbname as (libpq environment, host:port/dbname)."""
+    host, port, user, password, dbname = split_url(url, ("postgresql", "postgres"), 5432, "PG_URL")
+    env = {"PGHOST": host, "PGPORT": str(port), "PGDATABASE": dbname, "PGUSER": user, "PGPASSWORD": password}
+    return env, f"{host}:{port}/{dbname}"
+
+
+def oracle_from_url(url):
+    """oracle://user:password@host:port/service as (the Perl helper's environment, the DSN without dbi:Oracle:)."""
+    host, port, user, password, service = split_url(url, ("oracle",), 1521, "ORACLE_URL")
+    source = f"host={host};SERVICE_NAME={service};port={port}"
+    return {"DL_ORA_DSN": f"dbi:Oracle:{source}", "DL_ORA_USER": user, "DL_ORA_PWD": password}, source
 
 
 def to_int(text):
@@ -241,14 +305,21 @@ def link_fix(link):
     return f"the column default or identity on {link.column_label} is probably wrong; check it by hand"
 
 
-def block_item(seq, link, base, highest, distinct, first):
+def collision_text(unique):
+    """Whether running into a value already in the column makes an insert fail."""
+    if unique == "yes":
+        return "the column is the primary key or unique, so that insert fails"
+    return "if the column is meant to be unique that insert fails (the table has no primary key or unique index yet)"
+
+
+def block_item(seq, link, base, highest, distinct, first, unique=""):
     """A sequence with rows above it that do not look like its own run: say how soon it runs into them."""
     inc = seq.increment
     after = (first - base) // inc
     when = "on the next insert" if after == 0 else f"after {after} more inserts"
     rows = f"one value, {first}, is" if distinct == 1 else f"{distinct} different values from {first} to {highest} are"
     reason = (f"{rows} at or past its next value {base}, too sparse or too far up to be its own run (reserved IDs, "
-              f"or IDs typed in by hand?); it runs into {first} {when}")
+              f"or IDs typed in by hand?); it runs into {first} {when}; {collision_text(unique)}")
     fix = f"if those IDs are the sequence's own: {setval_sql(seq.label, highest + inc)}"
     if inc > 0:
         column, table = quote_ident(link.column), f"{link.schema}.{link.table}"
@@ -394,23 +465,50 @@ def decide_from_data(row, highest, column=""):
 
 
 def link_problems(links, known):
-    """Links-file lines naming a missing sequence, and columns more than one sequence is linked to."""
-    items, by_column = [], {}
+    """Links-file lines naming a sequence that does not exist on PostgreSQL."""
+    return [Manual(link.seq_label, link.column_label, "sequence not found",
+                   "sequence_links.txt names a sequence that does not exist on PostgreSQL",
+                   "fix or remove its line in sequence_links.txt")
+            for link in links if link.seq_label not in known]
+
+
+def shared_default_groups(links):
+    """(sequence, table) -> the links of every column of that table whose default calls that sequence, when
+    there are two or more: a copy-paste mistake in the DDL, as one of them is usually a foreign key."""
+    groups = {}
     for link in links:
-        if link.seq_label not in known:
-            items.append(Manual(link.seq_label, link.column_label, "sequence not found",
-                                "sequence_links.txt names a sequence that does not exist on PostgreSQL",
-                                "fix or remove its line in sequence_links.txt"))
-        else:
-            by_column.setdefault(link.column_label, {}).setdefault(link.seq_label, []).append(link.source)
-    for column, seqs in sorted(by_column.items()):
-        if len(seqs) > 1:
-            items.append(Manual(", ".join(sorted(seqs)), column, "more than one sequence",
-                                "linked to " + "; ".join(f"{s} ({', '.join(src)})" for s, src in sorted(seqs.items())),
-                                "keep the one its identity or column default calls; for an extra OWNED BY: "
-                                "ALTER SEQUENCE <other> OWNED BY NONE, for a links-file line: fix "
-                                "sequence_links.txt; drop the other if nothing uses it"))
-    return items
+        if link.source == "default":
+            groups.setdefault((link.seq_label, f"{link.schema}.{link.table}"), {}).setdefault(link.column_label, link)
+    return {key: list(cols.values()) for key, cols in groups.items() if len(cols) > 1}
+
+
+def read_ignore_file(path):
+    """Patterns for items known to need nothing, one per line: pattern [problem]  # reason, as (pattern, problem,
+    reason). With a problem named, only that problem is covered. A line without a reason is not used, so the file
+    cannot quietly hide problems."""
+    patterns, problems = [], []
+    if not path or not path.exists():
+        return patterns, problems
+    for number, line in enumerate(path.read_text().splitlines(), 1):
+        text, _, reason = line.partition("#")
+        text, reason = text.strip(), reason.strip()
+        if not text:
+            continue
+        if not reason:
+            problems.append(f"{path.name} line {number}: no reason after #, so it is not used")
+            continue
+        pattern, _, problem = text.partition(" ")
+        patterns.append((pattern.lower(), problem.strip(), reason))
+    return patterns, problems
+
+
+def ignored_by(item, patterns):
+    """The reason of the first pattern matching one of the item's names, or ""."""
+    for pattern, problem, reason in patterns:
+        if (not problem or problem == item.problem) and \
+                any(fnmatch.fnmatchcase(name.lower(), pattern) for name in item.names):
+            return reason
+    return ""
 
 
 def read_links_file(path, schemas):
@@ -455,16 +553,28 @@ class Databases:
             if owner:
                 self.schema_map[owner] = conf.pg_schema() or owner.lower()
         targets = sorted({c.target() for c in confs})
-        if len(targets) != 1:
-            raise SequenceError(f"confs point at different PostgreSQL targets: {', '.join(targets)}")
-        self.target = targets[0]
-        self.pg_env = confs[0].pg_env()
         first = confs[0]
-        self.ora_env = {"DL_ORA_DSN": first.get("ORACLE_DSN"), "DL_ORA_USER": first.get("ORACLE_USER"),
-                        "DL_ORA_PWD": first.get("ORACLE_PWD")}
+        pg_url, ora_url = os.environ.get("PG_URL", "").strip(), os.environ.get("ORACLE_URL", "").strip()
+        # Where each connection came from, for the output: the confs, or .env and where the confs point.
+        self.target_from = self.source_from = ""
+        if pg_url:
+            self.pg_env, self.target = pg_from_url(pg_url)
+            elsewhere = [t for t in targets if t != self.target]
+            self.target_from = " (PG_URL in .env" + (f"; the confs point at {', '.join(elsewhere)})" if elsewhere
+                                                     else ")")
+        elif len(targets) != 1:
+            raise SequenceError(f"confs point at different PostgreSQL targets: {', '.join(targets)}")
+        else:
+            self.target, self.pg_env = targets[0], first.pg_env()
+        if ora_url:
+            self.ora_env, self.source = oracle_from_url(ora_url)
+            self.source_from = " (ORACLE_URL in .env)"
+        else:
+            self.ora_env = {"DL_ORA_DSN": first.get("ORACLE_DSN"), "DL_ORA_USER": first.get("ORACLE_USER"),
+                            "DL_ORA_PWD": first.get("ORACLE_PWD")}
+            self.source = first.get("ORACLE_DSN").split(":", 2)[-1]
         if first.get("ORACLE_HOME"):
             self.ora_env["ORACLE_HOME"] = first.get("ORACLE_HOME")
-        self.source = first.get("ORACLE_DSN").split(":", 2)[-1]
         if cfg.oracle_rows:
             self.oracle_cmd = [cfg.oracle_rows]
         else:
@@ -496,7 +606,10 @@ class Databases:
     def psql(self, sql, timeout_seconds=0):
         env = {**os.environ, **self.pg_env}
         if timeout_seconds:
-            env["PGOPTIONS"] = f"-c statement_timeout={int(timeout_seconds * 1000)}"
+            # In the transaction, not as a startup option (PGOPTIONS): PgBouncer refuses those. SET LOCAL ends with
+            # the transaction, so a pooled server connection is not left with it.
+            sql = (f"BEGIN; SET LOCAL statement_timeout = {int(timeout_seconds * 1000)}; {sql.strip().rstrip(';')}; "
+                   "COMMIT;")
         r = subprocess.run([self.cfg.psql, "-X", "-q", "-A", "-t", "-F", SEP, "-v", "ON_ERROR_STOP=1", "-c", sql],
                            capture_output=True, text=True, env=env)
         return r.returncode, r.stdout.strip("\n"), (r.stderr.strip().splitlines() or [""])[0]
@@ -570,10 +683,47 @@ class Databases:
                                  f"WHERE {column} BETWEEN {low} AND {high}", timeout_seconds)
         if rc != 0:
             return None, None, err or f"psql exit code {rc}"
-        distinct, value = out.strip().split(SEP)
+        distinct, value = out.strip("\n").split(SEP)
         if not value:
             return None, None, "the rows above the sequence were gone when read again; run it again"
         return int(distinct), int(value), ""
+
+    def own_rows(self, link, start, stop, increment, jump, timeout_seconds):
+        """The values from `start` up to the sequence's next value `stop`: the last one before the first gap of more
+        than `jump` numbers, then the first and last value from that gap on and how many there are, as
+        (run_end, first, last, count, error); each value an int or None."""
+        name = quote_ident(link.schema) + "." + quote_ident(link.table)
+        column = quote_ident(link.column)
+        sign = 1 if increment > 0 else -1
+        where = (f"{column} >= {start} AND {column} < {stop}" if increment > 0
+                 else f"{column} <= {start} AND {column} > {stop}")
+        rc, out, err = self.psql(
+            f"WITH vals AS (SELECT DISTINCT {column} AS v FROM {name} WHERE {where}), "
+            f"g AS (SELECT v, (v - lag(v, 1, {start - increment}) OVER (ORDER BY v * {sign})) / {increment} AS step "
+            f"FROM vals), "
+            f"b AS (SELECT min(v * {sign}) * {sign} AS first FROM g WHERE step > {jump}) "
+            f"SELECT (SELECT max(v * {sign}) * {sign} FROM g WHERE b.first IS NULL OR v * {sign} < b.first * {sign}),"
+            f" b.first, (SELECT max(v * {sign}) * {sign} FROM g), "
+            f"(SELECT count(*) FROM g WHERE v * {sign} >= b.first * {sign}) FROM b", timeout_seconds)
+        if rc != 0:
+            return None, None, None, 0, err or f"psql exit code {rc}"
+        run_end, first, last, count = (to_int(v.split(".")[0]) for v in out.strip("\n").split(SEP))
+        return run_end, first, last, count or 0, ""
+
+    def pg_keys(self):
+        """(columns that are a primary key or unique on their own, tables with any primary key or unique index)"""
+        schemas = ", ".join(quote_literal(s) for s in self.pg_schemas)
+        unique, keyed = set(), set()
+        for schema, table, column in self.rows(PG_KEYS_SQL % schemas):
+            keyed.add(f"{schema}.{table}")
+            if column:
+                unique.add(f"{schema}.{table}.{column}")
+        return unique, keyed
+
+    def pg_foreign_keys(self):
+        """schema.table.column -> the schema.table it points at, for single-column foreign keys."""
+        schemas = ", ".join(quote_literal(s) for s in self.pg_schemas)
+        return {f"{r[0]}.{r[1]}.{r[2]}": f"{r[3]}.{r[4]}" for r in self.rows(PG_FOREIGN_KEYS_SQL % schemas)}
 
     def other_schemas(self):
         """Schemas on the target holding sequences that no conf names, with how many."""
@@ -588,13 +738,18 @@ class Sync:
         self.stamp = f"{datetime.now():%Y%m%d-%H%M%S}"
         self.extremes = {}      # column -> (highest, marker, error): the data does not change while this runs
         self.extra = []         # Manual items not tied to one sequence row: links, other schemas
+        self.keys = None        # (unique columns, tables with keys), read once
+        self.suspects = set()   # columns whose default calls a sequence that is not theirs: not raised from
+        # sequence_raise.txt: sequences whose rows above (a block typed in by hand) a person has said to go past
+        self.raise_patterns, self.raise_problems = read_ignore_file(cfg.sequence_raise)
 
     def target_problem(self, changing):
         expected = self.cfg.expected_target
+        where = "PG_URL in .env points" if self.db.target_from else "confs point"
         if expected and expected != self.db.target:
-            return f"confs point at {self.db.target} but dataload.toml expects {expected}; nothing was done"
+            return f"{where} at {self.db.target} but dataload.toml expects {expected}; nothing was done"
         if changing and not expected:
-            return f"[target] expected is not set in dataload.toml (the confs point at {self.db.target})"
+            return f"[target] expected is not set in dataload.toml (the {where} at {self.db.target})"
         return ""
 
     def compare(self):
@@ -606,12 +761,17 @@ class Sync:
         links = self.db.pg_links()
         rows = match(oracle, pg, links, self.db.schema_map)
         named = sum(1 for o in oracle if not o.identity and not o.name.startswith("ISEQ$$_"))
-        self.out(f"Oracle {self.db.source}: {len(oracle)} sequences ({named} named, {len(oracle) - named} identity)")
-        self.out(f"PostgreSQL {self.db.target}: {len(pg)} sequences in {len(self.db.pg_schemas)} schemas")
+        self.out(f"Oracle {self.db.source}{self.db.source_from}: {len(oracle)} sequences ({named} named, "
+                 f"{len(oracle) - named} identity)")
+        self.out(f"PostgreSQL {self.db.target}{self.db.target_from}: {len(pg)} sequences in {len(self.db.pg_schemas)} "
+                 "schemas")
         links_and_problems = self.all_links(links)
-        known = {s.label for s in pg}
-        self.extra = link_problems(links_and_problems[0], known) + self.other_schema_items()
-        self.settle(rows, links_and_problems, known)
+        sequences = {s.label: s for s in pg}
+        self.keys = self.db.pg_keys()
+        groups, self.suspects = self.shared_defaults(links_and_problems[0], sequences)
+        self.extra = (link_problems(links_and_problems[0], set(sequences)) + groups
+                      + self.multi_sequence_items(links_and_problems[0], sequences) + self.other_schema_items())
+        self.settle(rows, links_and_problems, set(sequences))
         return oracle, rows
 
     def all_links(self, links):
@@ -625,6 +785,136 @@ class Sync:
         if key not in self.extremes:
             self.extremes[key] = self.db.real_extreme(link, increment, self.cfg.sequence_check_timeout)
         return self.extremes[key]
+
+    def highest(self, link, increment):
+        """The column's highest value as a number, or None when empty, unreadable or not whole numbers."""
+        value, _, err = self.extreme(link, increment)
+        try:
+            return int(value) if value is not None and not err else None
+        except ValueError:
+            return None
+
+    def uniqueness(self, link):
+        """yes: primary key or unique on its own; no: the table has keys but this column is not one; "": no keys."""
+        if self.keys is None:
+            self.keys = self.db.pg_keys()
+        unique, keyed = self.keys
+        if link.column_label in unique:
+            return "yes"
+        return "no" if f"{link.schema}.{link.table}" in keyed else ""
+
+    def shared_defaults(self, links, sequences):
+        """One item per table where a sequence is the default on two or more columns, naming the column(s) whose
+        default is probably wrong: not the key while another column is, or holding values the sequence cannot have
+        produced. Returns (items, suspect columns). A foreign key goes first: a primary key that is also a foreign
+        key (one row per parent) holds the parent's IDs. With none, as after --skip-constraints, the keys decide."""
+        items, suspects = [], set()
+        foreign = self.db.pg_foreign_keys()
+        for (seq_label, table), group in sorted(shared_default_groups(links).items()):
+            seq = sequences.get(seq_label)
+            if seq is None:
+                continue
+            group = sorted(group, key=lambda l: l.column_label)
+            keys = {l.column_label: self.uniqueness(l) for l in group}
+            highs = {l.column_label: self.highest(l, seq.increment) for l in group}
+            unread = [l.column_label for l in group if self.extreme(l, seq.increment)[2]]
+            wrong, why = [], ""
+            pointing = [c for c in keys if c in foreign]
+            if unread:
+                pass                # the values decide as much as the keys do: no guess without them
+            elif pointing and len(pointing) < len(group):
+                wrong = pointing
+                why = "; ".join(f"a foreign key to {foreign[c]}, so its values come from there" for c in pointing)
+            elif "yes" in keys.values():
+                wrong = [c for c, k in keys.items() if k != "yes"]
+                why = "the table's key is " + ", ".join(c.split(".")[-1] for c, k in keys.items() if k == "yes")
+            else:
+                above = [c for c, h in highs.items() if h is not None and ahead(h, seq.next_value, seq.increment)]
+                if above and len(above) < len(group):
+                    wrong = above
+                    why = "their values are at or past the sequence's next value, so it never produced them"
+            columns = ", ".join(c.split(".")[-1] for c in keys)
+            def shown(c):
+                return "not read" if c in unread else highs[c] if highs[c] is not None else "(empty)"
+            evidence = "; ".join(f"{c.split('.')[-1]} highest {shown(c)}" + (" (key)" if keys[c] == "yes" else "")
+                                 for c in keys)
+            reason = (f"{seq_label} is the default on {len(group)} columns of {table} ({columns}); its next value is "
+                      f"{seq.next_value}; {evidence}")
+            if unread:
+                reason += f". Not judged: {', '.join(c.split('.')[-1] for c in unread)} could not be read"
+                fix = "read the columns first (see 'column not read'), then run again"
+            elif wrong:
+                reason += f". Probably wrong on {', '.join(c.split('.')[-1] for c in wrong)}: {why}"
+                fix = " ".join(f"ALTER TABLE {table} ALTER COLUMN {c.split('.')[-1]} DROP DEFAULT;" for c in wrong)
+            else:
+                fix = (f"keep it on the table's ID column and drop the others: ALTER TABLE {table} ALTER COLUMN "
+                       "<other> DROP DEFAULT;")
+            items.append(Manual(seq_label, ", ".join(keys), "default on the wrong column?", reason, fix))
+            suspects.update(wrong)
+        return items, suspects
+
+    def not_unique_item(self, link, seq, base, highest):
+        """A column that is not a key holds values past its sequence: no insert fails, the link is suspect."""
+        reason = (f"its values reach {highest}, past the sequence's next value {base}, but the column is not the "
+                  "primary key or unique, so no insert fails; it is probably not the sequence's column (a foreign key?)")
+        table = f"{link.schema}.{link.table}"
+        if link.source == "default":
+            fix = f"ALTER TABLE {table} ALTER COLUMN {link.column} DROP DEFAULT;"
+        elif link.source == "owned by":
+            fix = f"ALTER SEQUENCE {seq.label} OWNED BY NONE; (and point it at the column it really feeds)"
+        else:
+            fix = link_fix(link)
+        return Manual(seq.label, link.column_label, "default on the wrong column?", reason, fix)
+
+    def multi_sequence_items(self, links, sequences):
+        """Columns linked to two or more sequences, with each one's next value against the column's highest value:
+        the one just above it is most likely the one in use."""
+        by_column = {}
+        for link in links:
+            if link.seq_label in sequences:
+                by_column.setdefault(link.column_label, {}).setdefault(link.seq_label, []).append(link)
+        items = []
+        for column, seqs in sorted(by_column.items()):
+            if len(seqs) < 2:
+                continue
+            first = next(iter(seqs.values()))[0]
+            inc = sequences[next(iter(seqs))].increment
+            highest = self.highest(first, inc)
+            parts = [f"{s} ({', '.join(l.source for l in ls)}) next {sequences[s].next_value}"
+                     for s, ls in sorted(seqs.items())]
+            reason = "linked to " + "; ".join(parts)
+            default = [s for s, ls in seqs.items() if any(l.source in ("default", "identity") for l in ls)]
+            closest, tied = None, False
+            if highest is not None:
+                reason += f"; the column's highest value is {highest}"
+                above = [s for s in seqs if ahead(sequences[s].next_value, highest + inc, inc)]
+                if above:
+                    gap = min(abs(sequences[s].next_value - highest) for s in above)
+                    nearest = sorted(s for s in above if abs(sequences[s].next_value - highest) == gap)
+                    if len(nearest) == 1:
+                        closest = nearest[0]
+                        reason += f"; closest above it: {closest}"
+                    else:
+                        tied = True
+                        reason += (f"; {' and '.join(nearest)} are equally close (next "
+                                   f"{sequences[nearest[0]].next_value}): the values cannot tell which one is used")
+            table = f"{first.schema}.{first.table}"
+            if tied:
+                items.append(Manual(", ".join(sorted(seqs)), column, "more than one sequence", reason, (
+                    "find which one the application calls (nextval in its code or a trigger) and make that one the "
+                    "column default")))
+                continue
+            if closest and default and closest not in default:
+                fix = (f"if {closest} is the one the application uses: ALTER TABLE {table} ALTER COLUMN {first.column} "
+                       f"SET DEFAULT nextval('{closest}');")
+            elif closest and default:
+                fix = ("the column default looks right; fix or remove the other one's line in sequence_links.txt, or "
+                       "ALTER SEQUENCE <other> OWNED BY NONE")
+            else:
+                fix = ("keep the one its identity or column default calls; for an extra OWNED BY: ALTER SEQUENCE <other> "
+                       "OWNED BY NONE, for a links-file line: fix sequence_links.txt; drop the other if nothing uses it")
+            items.append(Manual(", ".join(sorted(seqs)), column, "more than one sequence", reason, fix))
+        return items
 
     def settle(self, rows, links_and_problems, known):
         """Each sequence against the data in the columns it feeds. It is raised past its data when the rows above
@@ -651,6 +941,8 @@ class Sync:
                     f"find what calls nextval('{seq.label}'): the application, or SELECT proname FROM pg_proc WHERE "
                     f"prosrc ILIKE '%{seq.name}%'; add its column to sequence_links.txt and run apply again, or drop "
                     "it if nothing uses it")))
+            elif row.action == "ahead":
+                self.far_ahead(row, [])
             return
         found, marked, unread = [], False, False
         for link in links:
@@ -683,26 +975,37 @@ class Sync:
             found.append((link, highest))
 
         base = row.goal if row.action == "set" else seq.next_value
-        best, blocks = None, []
+        best, blocks, told = None, [], self.raise_reason(seq)
         for link, highest in sorted((f for f in found if f[1] is not None), key=lambda f: f[1] * inc):
             if not ahead(highest, base, inc):
+                continue
+            if link.column_label in self.suspects:
+                continue                # listed once for its table: the default there is on the wrong column
+            unique = self.uniqueness(link)
+            if unique == "no":
+                blocks.append((highest, self.not_unique_item(link, seq, base, highest)))
+                continue
+            if (highest - base) // inc + 1 <= self.cfg.sequence_auto_raise_max_jump:
+                base, best = highest + inc, (link, highest)        # skipping this few numbers costs nothing
                 continue
             distinct, first, err = self.db.column_above(link, base, highest, inc, self.cfg.sequence_check_timeout)
             if err:
                 row.manual.append(self.not_read(link, err))
                 unread = True
-            elif own_run(base, highest, distinct, first, inc):
+            elif own_run(base, highest, distinct, first, inc) or told:
                 base, best = highest + inc, (link, highest)
             else:
-                blocks.append((highest, block_item(seq, link, base, highest, distinct, first)))
+                blocks.append((highest, block_item(seq, link, base, highest, distinct, first, unique)))
         # A block below a column that raised the sequence past it no longer matters.
         row.manual += [item for highest, item in blocks if ahead(highest, base, inc)]
-        highs = [h for _, h in found if h is not None]
+        highs = [h for l, h in found if h is not None and l.column_label not in self.suspects]
         if best:
             decide_from_data(row, best[1], best[0].column_label)
+            if told and row.data_next is not None:
+                row.reason += f", as {self.cfg.sequence_raise.name} says ({told})"
         elif only_pg:
             if blocks:
-                row.reason = "the rows above it look like a separate block; left alone"
+                row.reason = "rows above it that it may not have produced; left alone, listed for a person"
             elif unread and not highs:
                 row.reason = "its columns could not be read; left alone"
             elif marked and not highs:
@@ -711,6 +1014,62 @@ class Sync:
                 decide_from_data(row, (max if inc > 0 else min)(highs) if highs else None)
         if row.data_highest is None and highs:
             row.data_highest = (max if inc > 0 else min)(highs)
+        if not only_pg and row.action == "ahead" and not unread:
+            self.far_ahead(row, found)          # never a lowering without all of its data
+
+    def raise_reason(self, seq):
+        """The sequence_raise.txt reason that lets apply go past the rows above this sequence, or ""."""
+        for pattern, _, reason in self.raise_patterns:
+            if fnmatch.fnmatchcase(seq.label.lower(), pattern):
+                return reason
+        return ""
+
+    def far_ahead(self, row, found):
+        """A matched sequence left more than ahead_warn_gap numbers past where it should be: Oracle's value, or past
+        the rows that follow on from it without a gap of more than auto_raise_max_jump numbers. apply never lowers a
+        sequence, so an earlier setval or a reload by TRUNCATE over a used database leaves it there. Nothing
+        collides, but new IDs go far up, maybe into reserved IDs; lowering it is for a person to decide."""
+        seq, inc, limit = row.target, row.target.increment, self.cfg.sequence_ahead_warn_gap
+        if limit <= 0 or (seq.next_value - row.oracle_next) // inc <= limit:
+            return
+        jump = max(1, self.cfg.sequence_auto_raise_max_jump)
+        expected, own, blocks = row.oracle_next, None, []
+        for link, highest in found:
+            if highest is None or link.column_label in self.suspects or self.uniqueness(link) == "no":
+                continue
+            run_end, first, last, count, err = self.db.own_rows(link, row.oracle_next, seq.next_value, inc, jump,
+                                                                self.cfg.sequence_check_timeout)
+            if err:
+                return          # where its own rows end is not known: say nothing rather than suggest a value
+            if run_end is not None and ahead(run_end, expected, inc):
+                expected, own = run_end + inc, (link, run_end)
+            if first is not None:
+                blocks.append((link, first, last, count))
+        gap = (seq.next_value - expected) // inc
+        if gap <= limit:
+            return
+        # With more than one column, one column's block can reach past another's own rows: no clean value then.
+        across = [b for b in blocks if not ahead(b[1], expected, inc) and ahead(b[2], expected, inc)]
+        blocks = sorted((b for b in blocks if ahead(b[1], expected, inc)), key=lambda b: b[1] * inc)
+        where = f"Oracle's value {row.oracle_next}" + (f"; {own[0].column_label} holds its own rows up to {own[1]}"
+                                                        if own else "")
+        reason = f"its next value {seq.next_value} is {gap} numbers past where it should be, {expected} ({where}); "
+        fix = f"a lowering, for the DBA and only if the team wants it: {setval_sql(seq.label, expected)}"
+        column = own[0].column_label if own else ""
+        if across:
+            link, first, last, count = across[0]
+            reason += f"but {link.column_label} holds values from {first} to {last} across that, so no value is clean; "
+            fix = "leave it, or pick a value by hand past every column's rows"
+            column = link.column_label
+        elif blocks:
+            link, first, last, count = blocks[0]
+            values = f"one value, {first}, sits" if count == 1 else f"{count} values from {first} to {last} sit"
+            reason += f"{values} in between (reserved IDs, or typed in by hand?) and new IDs now come after them; "
+            fix += f" it then runs into {first} after {(first - expected) // inc} inserts"
+            column = link.column_label
+        reason += ("nothing collides, but apply never lowers a sequence, so an earlier setval or a reload by TRUNCATE "
+                   "over a used database left it here")
+        row.manual.append(Manual(seq.label, column, "far ahead", reason, fix))
 
     def not_read(self, link, err):
         fix = (f"read it by hand: SELECT max({quote_ident(link.column)}) FROM {link.schema}.{link.table}; or raise "
@@ -742,28 +1101,46 @@ class Sync:
             items += r.manual
         return items + self.extra
 
+    def not_ignored(self, items):
+        patterns, _ = read_ignore_file(self.cfg.sequence_ignore)
+        return [m for m in items if not ignored_by(m, patterns)]
+
     def report_manual(self, items):
-        """Prints what needs a person, grouped by problem, and writes them all to a CSV. Returns the items."""
+        """Prints what needs a person, grouped by problem, and writes them all to a CSV, those sequence_ignore.txt
+        covers too. Returns the items it does not cover."""
         seen, unique = set(), []
         for m in items:
             if (m.sequence, m.column) not in seen:
                 seen.add((m.sequence, m.column))
                 unique.append(m)
+        patterns, problems = read_ignore_file(self.cfg.sequence_ignore)
+        for p in problems + self.raise_problems:
+            self.out(f"warning: {p}")
         if not unique:
             self.out("\nNothing needs a person.")
             return unique
-        self.cfg.logs.mkdir(parents=True, exist_ok=True)
-        path = self.cfg.logs / f"sequences-manual-{self.stamp}.csv"
         unique.sort(key=lambda m: (MANUAL_ORDER.index(m.problem) if m.problem in MANUAL_ORDER else len(MANUAL_ORDER),
                                    m.sequence, m.column))
+        reasons = {id(m): ignored_by(m, patterns) for m in unique}
+        kept = [m for m in unique if not reasons[id(m)]]
+        ignored = len(unique) - len(kept)
+        self.cfg.logs.mkdir(parents=True, exist_ok=True)
+        path = self.cfg.logs / f"sequences-manual-{self.stamp}.csv"
         with open(path, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["problem", "sequence", "column", "reason", "suggested_fix", "postgresql_target"])
+            w.writerow(["problem", "sequence", "column", "reason", "suggested_fix", "ignored_because",
+                        "postgresql_target"])
             for m in unique:
-                w.writerow([m.problem, m.sequence, m.column, m.reason, m.fix, self.db.target])
-        self.out(f"\nNeeds a person: {len(unique)}, each with the reason and a suggested fix")
+                w.writerow([m.problem, m.sequence, m.column, m.reason, m.fix, reasons[id(m)], self.db.target])
+        left_off = (f"{ignored} known item{'s' if ignored != 1 else ''} left off, as {self.cfg.sequence_ignore.name} "
+                    "says")
+        if not kept:
+            self.out(f"\nNothing needs a person ({left_off}). List: {path}")
+            return kept
+        self.out(f"\nNeeds a person: {len(kept)}, each with the reason and a suggested fix"
+                 + (f" ({left_off})" if ignored else ""))
         groups = {}
-        for m in unique:
+        for m in kept:
             groups.setdefault(m.problem, []).append(m)
         for problem, group in groups.items():
             self.out(f"\n  {problem} ({len(group)}):")
@@ -775,7 +1152,7 @@ class Sync:
             if len(group) > MANUAL_SHOWN:
                 self.out(f"    ... and {len(group) - MANUAL_SHOWN} more in the CSV")
         self.out(f"\nList: {path}")
-        return unique
+        return kept
 
     def summary(self, rows, verb):
         names = {"set": verb, "ahead": "already level or past Oracle", "refused": "refused",
@@ -812,7 +1189,7 @@ class Sync:
 
     def plan(self):
         problem = self.target_problem(changing=False)
-        if problem.startswith("confs point"):
+        if " but dataload.toml expects " in problem:
             self.out(problem)
             return 2
         if problem:
@@ -851,7 +1228,9 @@ class Sync:
         failed = [r for r in rows if r.action == "failed"]
         self.out(f"Details: {self.write_csv(rows, 'apply')}")
         checked = self.check(report=False)
-        manual = self.report_manual(self.manual_items(rows) + self.check_items)
+        # The check finds the wrong defaults again with the values after the apply; those found before are stale.
+        before = [m for m in self.manual_items(rows) if m.problem != "default on the wrong column?"]
+        manual = self.report_manual(before + self.check_items)
         return 1 if failed or moved or checked or manual else 0
 
     def agreed(self, yes, confirm, question):
@@ -955,15 +1334,19 @@ class Sync:
         is kept in self.check_items, and listed when `report` is set."""
         self.check_items = []
         problem = self.target_problem(changing=False)
-        if problem.startswith("confs point"):
+        if " but dataload.toml expects " in problem:
             self.out(problem)
             return 2
         sequences = {s.label: s for s in self.db.pg_sequences()}
         links, problems = self.all_links(self.db.pg_links())
         types = {l.column_label: l.data_type for l in links if l.data_type}
         results = []
+        self.keys = self.db.pg_keys()
+        groups, self.suspects = self.shared_defaults(links, sequences)
+        self.check_items += groups
         if report:
-            self.check_items += link_problems(links, set(sequences)) + self.other_schema_items()
+            self.check_items += (link_problems(links, set(sequences)) + self.multi_sequence_items(links, sequences)
+                                 + self.other_schema_items())
 
         def one(link):
             seq = sequences.get(link.seq_label)
@@ -986,17 +1369,27 @@ class Sync:
                 result, reason = "placeholder", (f"all-nines marker rows ({marker}) above the real rows; expected, "
                                                  "same as on Oracle")
             item = None
-            if result == "needs a look":
+            unique = self.uniqueness(link) if result == "needs a look" else ""
+            if result != "needs a look" or link.column_label in self.suspects:
+                pass                    # a suspect column is listed once for its table
+            elif unique == "no":
+                item = self.not_unique_item(link, seq, seq.next_value, highest)
+            else:
                 distinct, first, err = self.db.column_above(link, seq.next_value, highest, seq.increment,
                                                             self.cfg.sequence_check_timeout)
+                jump = (highest - seq.next_value) // seq.increment + 1
                 if err:
                     item = self.not_read(link, err)
-                elif own_run(seq.next_value, highest, distinct, first, seq.increment):
+                elif own_run(seq.next_value, highest, distinct, first, seq.increment) or \
+                        jump <= self.cfg.sequence_auto_raise_max_jump or self.raise_reason(seq):
+                    told = f", as {self.cfg.sequence_raise.name} says" if self.raise_reason(seq) else ""
                     item = Manual(seq.label, link.column_label, "needs a look", (
                         f"rows from {first} to {highest} already hold numbers the sequence will hand out (next "
-                        f"{seq.next_value})"), f"run apply, which raises it, or {setval_sql(seq.label, highest + seq.increment)}")
+                        f"{seq.next_value}); {collision_text(unique)}"),
+                        f"{setval_sql(seq.label, highest + seq.increment)} (apply does this on its own{told}"
+                        + (", except for a sequence only on PostgreSQL: marker rows wait for a person)" if marker else ")"))
                 else:
-                    item = block_item(seq, link, seq.next_value, highest, distinct, first)
+                    item = block_item(seq, link, seq.next_value, highest, distinct, first, unique)
             return link, seq, result, reason, item, highest
 
         with ThreadPoolExecutor(max_workers=max(1, self.cfg.count_workers)) as pool:
@@ -1032,8 +1425,8 @@ class Sync:
                                                "fix or remove its line in sequence_links.txt"))
         self.out(f"Details: {path}")
         if report:
-            self.report_manual(self.check_items)
-        return 1 if counts.get("needs a look") or counts.get("not checked") or self.check_items else 0
+            return 1 if self.report_manual(self.check_items) else 0
+        return 1 if self.not_ignored(self.check_items) else 0
 
 
 def main(argv=None):
